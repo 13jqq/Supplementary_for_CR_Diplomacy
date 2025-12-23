@@ -184,8 +184,7 @@ class BayesAgentState(SearchBotAgentState):
         super().__init__(power)
         self.belief_state = BeliefState(player_types)
         self.dynamic_lambda_scale_cache: Dict[Phase, Dict[Power, float]] = {}
-    def get_cached_value_tables(self, game: pydipcc.Game):        
-        return None
+
 
 @dataclasses.dataclass
 class PlayerTypeSpec:
@@ -364,6 +363,7 @@ class BQRE1PAgent(SearchBotAgent):
 
     def __init__(self, cfg: agents_cfgs.BQRE1PAgent, *, skip_base_strategy_model_cache=False):
         #################  refactored from base class ###########################
+        print('------------------------------ Loading Agent ------------------------------')
         super().__init__(
             cfg.base_searchbot_cfg, skip_base_strategy_model_cache=skip_base_strategy_model_cache
         )
@@ -1293,18 +1293,11 @@ if __name__ == "__main__":
     torch.manual_seed(0)
 
     game = pydipcc.Game()
-    # cfg = heyhi.load_config(
-    #     pathlib.Path(__file__).resolve().parents[2]
-    #     / "conf/common/agents/bqre1p_20210723.prototxt",
-    #     overrides=["bqre1p.base_searchbot_cfg.n_rollouts=64"] + sys.argv[1:],
-    # )
     cfg = heyhi.load_config(
         pathlib.Path(__file__).resolve().parents[2]
-        / "conf/common/agents/for_tests/bqre1p_20210821_rol0.prototxt",
+        / "conf/common/agents/bqre1p_20210723.prototxt",
         overrides=["bqre1p.base_searchbot_cfg.n_rollouts=64"] + sys.argv[1:],
     )
-
-    # diplomacy_cicero/conf/common/agents/for_tests/bqre1p_20210821_rol0.prototxt
     print(cfg.bqre1p)
     agent = BQRE1PAgent(cfg.bqre1p)
     print(agent.get_orders(game, power="AUSTRIA", state=agent.initialize_state(power="AUSTRIA")))

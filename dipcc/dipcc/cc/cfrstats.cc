@@ -8,13 +8,22 @@ LICENSE file in the root directory of this source tree.
 
 #include <cmath>
 
+/*
+SinglePowerCFRStats (单个power的CFR统计)
+    ├── ActionData (每个动作的数据)
+    └── update() 核心算法
+    
+CFRStats (所有power的CFR统计管理器)
+    └── 包装多个 SinglePowerCFRStats
+    */
+
 namespace dipcc {
 
 SinglePowerCFRStats::ActionData::ActionData() {}
 
 SinglePowerCFRStats::ActionData::ActionData(double b) : bp_prob(b) {}
 
-SinglePowerCFRStats::SinglePowerCFRStats(bool use_linear_weighting,
+SinglePowerCFRStats::SinglePowerCFRStats(bool use_linear_weighting, 
                                          bool use_optimistic_cfr, bool qre,
                                          bool qre_target_blueprint,
                                          double qre_eta)
@@ -62,6 +71,7 @@ void SinglePowerCFRStats::update(double state_utility,
          "passed in action_utilities has the wrong length");
 
   // Discount for linear cfr
+    // 线性权重（linear CFR）时，对累计量做折扣
   if (use_linear_weighting_) {
     double discount_factor = (cfr_iter + 0.000001) / (cfr_iter + 1.0);
     cum_utility_ *= discount_factor;
@@ -76,14 +86,17 @@ void SinglePowerCFRStats::update(double state_utility,
   }
 
   // Accumulate all stats
+   // 累积整体 utility 统计
   cum_utility_ += state_utility;
   cum_squtility_ += state_utility * state_utility;
   cum_weight_ += 1.0;
+  // 核心：按 “每个动作的 utility − 当前策略 utility” 累积 regret
   for (int action_idx = 0; action_idx < actions_.size(); ++action_idx) {
     ActionData &action_data = actions_[action_idx];
     action_data.cum_regret += action_utilities[action_idx] - state_utility;
     action_data.cum_utility += action_utilities[action_idx];
   }
+   // 累积 average strategy 用的概率（要么是上一轮 next_prob，要么是 blueprint）
   if (which_strategy_to_accumulate == ACCUMULATE_PREV_ITER) {
     for (ActionData &action_data : actions_)
       action_data.cum_prob += action_data.next_prob;
@@ -96,6 +109,7 @@ void SinglePowerCFRStats::update(double state_utility,
   }
 
   // Recompute the next probabilites of actions, QRE
+   // 然后根据模式重算 next_prob（下面分 QRE 和 regret matching 两种）
   if (qre_) {
     double avg_utility = cum_utility_ / cum_weight_;
     double avg_squtility = cum_squtility_ / cum_weight_;
@@ -145,6 +159,7 @@ void SinglePowerCFRStats::update(double state_utility,
     }
   }
   // Recompute the next probabilites of actions, SearchBot (regret matching)
+  // 这里是searchbot的regret matching模式
   else {
     // Compute relative probabilities proportional to positive regret
     double sum_relative_prob = 0.0;
@@ -162,6 +177,7 @@ void SinglePowerCFRStats::update(double state_utility,
            "cfr produced nan or infinite probabilities");
     if (sum_relative_prob == 0.0) {
       // Handle case where there are no positive regrets
+      // 没有正遗憾时，选 regret 最大的动作为 1，其余 0
       int best_action_idx = -1;
       for (int action_idx = 0; action_idx < actions_.size(); ++action_idx) {
         ActionData &action_data = actions_[action_idx];
@@ -175,7 +191,7 @@ void SinglePowerCFRStats::update(double state_utility,
         action_data.next_prob = (action_idx == best_action_idx ? 1.0 : 0.0);
       }
     } else {
-      // Normalize normally
+      // Normalize normally否则按 “正遗憾归一化” 作为策略
       for (int action_idx = 0; action_idx < actions_.size(); ++action_idx) {
         ActionData &action_data = actions_[action_idx];
         action_data.next_prob /= sum_relative_prob;

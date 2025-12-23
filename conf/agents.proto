@@ -1024,5 +1024,6 @@ message Agent {
     ParlaiFullPressAgent parlai_full_press = 11;
     BQRE1PAgent bqre1p = 15;
     TheBestAgent best_agent = 18;
+    BQRE1PAgentCfg coo_agent = 13;
   }
 }

@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.10)
 project(postman VERSION 0.0.1 LANGUAGES CXX)
 
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error=maybe-uninitialized")
+
 if(NOT DEFINED POSTMAN_DIR)
   message(FATAL_ERROR "Must set 'POSTMAN_DIR' variable")
 endif(NOT DEFINED POSTMAN_DIR)

@@ -240,15 +240,38 @@ class BaseStrategyModelV2(nn.Module):
 
     def _embed_orders(self, orders: torch.Tensor, x_board_state: torch.Tensor):
         B, NUM_LOCS, _ = x_board_state.shape
-        order_emb = self.prev_order_embedding(orders[:, 0])
-        if self.featurize_prev_orders:
-            order_emb = torch.cat((order_emb, self.order_feats[orders[:, 0]]), dim=-1)
+        # order_emb = self.prev_order_embedding(orders[:, 0])
+        # if self.featurize_prev_orders:
+        #     order_emb = torch.cat((order_emb, self.order_feats[orders[:, 0]]), dim=-1)
 
-        # insert the prev orders into the correct board location
+        # # insert the prev orders into the correct board location
+        # order_exp = x_board_state.new_zeros(B, NUM_LOCS, self.prev_order_enc_size)
+        # prev_order_loc_idxs = torch.arange(B, device=x_board_state.device).repeat_interleave(
+        #     orders.shape[-1]
+        # ) * NUM_LOCS + orders[:, 1].reshape(-1)
+
+
+                # 1) 取出 embedding
+        order_emb = self.prev_order_embedding(orders[:, 0])
+
+        if self.featurize_prev_orders:
+            order_feats = self.order_feats[orders[:, 0]]
+            # 确保和 embedding 的 dtype 一致，再 cat
+            if order_feats.dtype != order_emb.dtype:
+                order_feats = order_feats.to(order_emb.dtype)
+            order_emb = torch.cat((order_emb, order_feats), dim=-1)
+
+        # 2) 用 board_state 创建 zeros（继承 device / dtype）
         order_exp = x_board_state.new_zeros(B, NUM_LOCS, self.prev_order_enc_size)
-        prev_order_loc_idxs = torch.arange(B, device=x_board_state.device).repeat_interleave(
-            orders.shape[-1]
-        ) * NUM_LOCS + orders[:, 1].reshape(-1)
+
+        # ⭐关键一步：让 source 的 dtype 和 target 一致，避免 index_add_ 报错
+        if order_emb.dtype != order_exp.dtype:
+            order_emb = order_emb.to(order_exp.dtype)
+
+        # 3) 计算 index，执行 index_add_
+        prev_order_loc_idxs = torch.arange(
+            B, device=x_board_state.device
+        ).repeat_interleave(orders.shape[-1]) * NUM_LOCS + orders[:, 1].reshape(-1)
         order_exp.view(-1, self.prev_order_enc_size).index_add_(
             0, prev_order_loc_idxs, order_emb.view(-1, self.prev_order_enc_size)
         )
@@ -271,6 +294,26 @@ class BaseStrategyModelV2(nn.Module):
         x_current_orders: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Runs encoder."""
+        # # ========= 0. 统一成 float32，避免 CPU 上 Half 带来的各种坑 =========float32【1127解决GPU问题】
+        # x_board_state = x_board_state.float()
+        # x_prev_state = x_prev_state.float()
+        # x_build_numbers = x_build_numbers.float()
+        # x_season = x_season.float()
+        # x_in_adj_phase = x_in_adj_phase.float()
+
+        # if x_has_press is not None:
+        #     x_has_press = x_has_press.float()
+        # if x_player_ratings is not None:
+        #     x_player_ratings = x_player_ratings.float()
+        # if x_scoring_system is not None:
+        #     x_scoring_system = x_scoring_system.float()
+        # if x_year_encoded is not None:
+        #     x_year_encoded = x_year_encoded.float()
+        # if x_agent_power is not None:
+        #     x_agent_power = x_agent_power.float()
+
+
+        # ========= 1. 原来的逻辑从这里继续 =========
 
         # following https://arxiv.org/pdf/2006.04635.pdf , Appendix C
         B, NUM_LOCS, _ = x_board_state.shape

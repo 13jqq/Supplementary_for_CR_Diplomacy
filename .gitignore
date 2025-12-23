@@ -40,3 +40,25 @@ dipcc/Testing/
 /src/
 dipcc/detect_cuda_version.cc
 node_modules/
+# build artifacts
+dipcc/build/
+build/
+**/build/
+
+# models / checkpoints
+models/
+models_encrypted/
+*.pt
+*.pth
+*.ckpt
+*.bin
+
+# logs / runs
+outputs/
+runs/
+wandb/
+*.log
+
+# OS / python
+__pycache__/
+*.pyc

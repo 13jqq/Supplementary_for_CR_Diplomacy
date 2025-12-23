@@ -213,6 +213,16 @@ class CFRData:
         # network some dead power may have non-zero utilities.
         # Note, that the plausible order sampler by default adds empty policies
         # for all powers.
+        # 确保所有权力都有行动。这保证了我们对每个权力都进行效用计算，从而正确计算状态值。
+        # 理论上，只有存活的权力才应该具有非零效用，因此我们只需要增强没有指令的存活权力。
+        # 但实际上，由于状态值是由一个值网络计算的，一些失效的权力可能具有非零效用。
+        # 请注意，默认情况下，合理的指令采样器会为所有权力添加空策略。
+
+        # 输入： bp_policy蓝图策略 prob 可以是 0，但键必须存在（即每个 Power 至少有一个动作）
+        # use_optimistic_cfr 控制 CFRStats 内部是否用 optimistic/hedge 风格的加权。
+        # qre 若非空，则启用 QRE（Quantal Response Equilibrium） 修正：把蓝图概率当成熵正则/先验的一部分；支持 agent 专属的 λ/entropy 因子。（在这个算法中没用）（后续可以直接改为True试一试）
+        # 剩下两个也没用
+
         for power in bp_policy:
             assert bp_policy[
                 power
@@ -220,6 +230,9 @@ class CFRData:
 
         self.use_optimistic_cfr = use_optimistic_cfr
         use_linear_weighting = True
+        # print("qre", qre)
+        # input()
+        # 无QRE
         if qre:
             use_qre = True
             qre_target_blueprint = qre.target_pi == "BLUEPRINT"
@@ -250,16 +263,28 @@ class CFRData:
             power_qre_lambda = {p: qre_lambda for p in POWERS}
             power_qre_entropy_factor = {p: qre_entropy_factor for p in POWERS}
 
+        # print("scale_lambdas_by_power", scale_lambdas_by_power)
+        # input()
+        # 这里没有scale_lambdas_by_power
         if scale_lambdas_by_power is not None:
             for power in scale_lambdas_by_power:
                 power_qre_lambda[power] *= scale_lambdas_by_power[power]
 
+        # print("power_qre_lambda", power_qre_lambda)
+        # input()
+        # power_qre_lambda {'AUSTRIA': 0.0, 'ENGLAND': 0.0, 'FRANCE': 0.0, 'GERMANY': 0.0, 'ITALY': 0.0, 'RUSSIA': 0.0, 'TURKEY': 0.0}
         self.power_qre_lambda = power_qre_lambda
+        # 这个self.power_qre_lambda也一直是0
         self.power_plausible_orders: PlausibleOrders = {p: sorted(v) for p, v in bp_policy.items()}
+        # 注意这里对动作本身（Action）排序，不是按概率。这样保证每个 Power 的动作列表是固定顺序，方便用“下标”与 CFRStats 内部张量对齐。
+        # 总之 是按照所有命令的字符大小排了一个先后顺序
         power_plausible_action_probs = {
             p: [bp_policy[p][a] for a in self.power_plausible_orders[p]] for p in POWERS
         }
+        # print("power_plausible_action_probs", power_plausible_action_probs)
+        # input()
 
+        # 这个初始化将Python的字典格式转换为C++的向量格式。
         self.stats = CFRStats(
             use_linear_weighting,
             use_optimistic_cfr,
@@ -272,33 +297,43 @@ class CFRData:
         )
 
     def cur_iter_strategy(self, pwr: Power) -> List[float]:
+        # 从C++获取当前轮的概率列表
         return self.stats.cur_iter_strategy(pwr)
 
     def cur_iter_policy(self, pwr: Power) -> Policy:
+        #  转换为Python字典格式
         return sorted_policy(self.power_plausible_orders[pwr], self.cur_iter_strategy(pwr))
 
     def avg_strategy(self, pwr: Power) -> List[float]:
+        # 获取所有CFR迭代的平均策略（这是CFR收敛的关键）
         return self.stats.avg_strategy(pwr)
 
     def avg_policy(self, pwr: Power) -> Policy:
+        # 转换为字典格式
         return sorted_policy(self.power_plausible_orders[pwr], self.avg_strategy(pwr))
 
     def avg_utility(self, pwr: Power) -> float:
+        # 该国家的平均得分
         return self.stats.avg_utility(pwr)
 
     def avg_action_utilities(self, pwr: Power) -> List[float]:
+        # 每个行动的平均得分列表
         return self.stats.avg_action_utilities(pwr)
 
     def avg_action_utility(self, pwr: Power, a: Action) -> float:
+        # 特定行动的平均得分
         return self.stats.avg_action_utility(pwr, self.power_plausible_orders[pwr].index(a))
 
     def avg_action_regret(self, pwr: Power, a: Action) -> float:
+        # 获取特定行动的平均遗憾值
         return self.stats.avg_action_regret(pwr, self.power_plausible_orders[pwr].index(a))
 
     def avg_action_prob(self, pwr: Power, a: Action) -> float:
+        #  特定行动在平均策略中的概率
         return self.stats.avg_action_prob(pwr, self.power_plausible_orders[pwr].index(a))
 
     def cur_iter_action_prob(self, pwr: Power, a: Action) -> float:
+        # 特定行动在当前策略中的概率
         return self.stats.cur_iter_action_prob(pwr, self.power_plausible_orders[pwr].index(a))
 
     def bp_strategy(self, pwr: Power, temperature=1.0) -> List[float]:
@@ -307,6 +342,7 @@ class CFRData:
     def bp_policy(self, pwr: Power, temperature=1.0) -> Policy:
         return sorted_policy(self.power_plausible_orders[pwr], self.bp_strategy(pwr, temperature))
 
+    # CFR中的那个更新
     def update(
         self,
         pwr: Power,
@@ -394,6 +430,8 @@ class SearchBotAgentState(AgentState):
 class SearchBotAgent(BaseSearchAgent):
     """One-ply cfr with base_strategy_model-policy rollouts"""
 
+    #在 __init__ 里，SearchBot 通过 cfg 把训练好的权重装进几个包装器
+
     def __init__(self, cfg: agents_cfgs.SearchBotAgent, *, skip_base_strategy_model_cache=False):
         super().__init__(cfg)
         base_strategy_model_wrapper_kwargs = dict(
@@ -408,6 +446,14 @@ class SearchBotAgent(BaseSearchAgent):
             force_disable_all_power=True,
             **base_strategy_model_wrapper_kwargs,
         )
+        # 由 cfg.model_path / rollout_model_path + value_model_path 指定
+        # 这是“策略/价值一体”的基础模型接口：对给定状态 + 一组联合作令，它能跑前向得到各阵营的价值评估和/或给出候选动作/概率。
+        
+        # input()
+        # print("base_strategy_model", self.base_strategy_model)
+        # print(cfg.model_path)
+        # print(cfg.value_model_path)
+          
         self.cfg = cfg
         self.has_press = cfg.dialogue is not None
         self.set_player_rating = cfg.set_player_rating
@@ -432,6 +478,11 @@ class SearchBotAgent(BaseSearchAgent):
             has_press=self.has_press,
             set_player_ratings=self.set_player_rating,
         )
+        # 一个专门用于执行 rollout（推演）的组件，它的主要任务是：
+
+        # 从当前游戏状态开始，使用基础策略模型来模拟游戏的后续进程
+        # 评估不同行动选择的长期价值
+        # 为 CFR 搜索算法提供价值估计
         self.bilateral_cfg = cfg.bilateral_dialogue
         assert cfg.n_rollouts >= 0, "Set searchbot.n_rollouts"
 
@@ -483,6 +534,7 @@ class SearchBotAgent(BaseSearchAgent):
                 base_strategy_model_rollouts_kwargs=allpower_rollouts_kwargs,
             )
 
+        #加载parlai语言模型，searchbot没有，cicero有
         if cfg.parlai_model_orders.model_path:
             if cfg.rescoring_blueprint_model_path is not None:
                 raise RuntimeError(
@@ -512,6 +564,19 @@ class SearchBotAgent(BaseSearchAgent):
             )
         else:
             self.proposal_base_strategy_model = self.base_strategy_model
+        
+        
+        #合理行动采样器初始化
+        #产生的数据结构：
+
+        # 行动生成器，每个国家最多考虑 8 个合理行动
+        # 与蓝图模型绑定，用于生成初始行动集
+        # 配置文件中的内容：
+        # plausible_orders_cfg {
+        #     n_plausible_orders: 8
+        #     max_actions_units_ratio: 3
+        #     req_size: 2100
+        # }
         self.order_sampler = PlausibleOrderSampler(
             cfg.plausible_orders_cfg,
             base_strategy_model=self.proposal_base_strategy_model,
@@ -519,6 +584,7 @@ class SearchBotAgent(BaseSearchAgent):
         )
         self.order_aug_cfg = cfg.order_aug
 
+        #无
         if cfg.rescoring_blueprint_model_path:
             assert self.parlai_model_orders is None
             assert (
@@ -581,12 +647,18 @@ class SearchBotAgent(BaseSearchAgent):
     # Overrides BaseAgent
     def get_orders(self, game: Game, power: Power, state: AgentState) -> Action:
         assert isinstance(state, SearchBotAgentState)
+        # 尝试获取缓存结果
         cfr_result = self.try_get_cached_search_result(game, state)
 
         if not cfr_result:
+            # 生成蓝图策略
             bp_policy = self.maybe_get_incremental_bp(game, agent_power=power, agent_state=state)
 
             if self.use_br_correlated_search(game.phase, "final_order"):
+                # 完全没用！
+                # print("in use_br_correlated_search")
+                # input()
+
                 cfr_result = self.run_best_response_against_correlated_bilateral_search(
                     game,
                     bp_policy=bp_policy,
@@ -595,6 +667,7 @@ class SearchBotAgent(BaseSearchAgent):
                     agent_state=state,
                 )
             else:
+                # 运行CFR搜索
                 cfr_result = self.run_search(
                     game,
                     bp_policy=bp_policy,
@@ -603,6 +676,7 @@ class SearchBotAgent(BaseSearchAgent):
                     agent_state=state,
                 )
         state.update(game, power, cfr_result, None)
+        # 从CFR结果中采样行动
         return cfr_result.sample_action(power)
 
     # Overrides BaseAgent
@@ -628,14 +702,27 @@ class SearchBotAgent(BaseSearchAgent):
 
         If exploiting an agent, the blueprint will be the agent's computed average policy.
         If allow_augment is false, will not attempt to apply augmentations like double oracle.
+        计算所有智能体的蓝图策略。
+
+        如果利用某个智能体，则蓝图将是该智能体计算得到的平均策略。
+
+        如果 allow_augment 为 false，则不会尝试应用诸如双重预言机之类的增强策略。
         """
 
-        # Determine the set of plausible actions to consider for each power
+        # Determine the set of plausible actions to consider for each power确定每个国家可考虑采取的一系列合理行动。
+        # self.order_sampler = PlausibleOrderSampler order_sampler是一个用蓝图策略初始化好的每个阵营的动作概率
         policy = self.order_sampler.sample_orders(
             game, agent_power=agent_power, speaking_power=agent_power, player_rating=player_rating
         )
+        print("policy", policy)
+        # 这里输出的是各个国家，所有单位，前八个概率的可选动作
+# 'AUSTRIA': {('A VIE - GAL', 'F TRI - ALB', 'A BUD - SER'): 0.6830951448000878, ('A VIE - TRI', 'F TRI - ALB', 'A BUD - SER'): 0.10591494933371186, ('A VIE - GAL', 'F TRI - VEN', 'A BUD - SER'): 0.08524365723758108, ('A VIE - GAL', 'F TRI S A VEN', 'A BUD - SER'): 0.039619842664801584, ('A VIE - GAL', 'F TRI H', 'A BUD - SER'): 0.03310225152952094, ('A VIE - BUD', 'F TRI - ALB', 'A BUD - SER'): 0.025802689762493107, ('A VIE - TRI', 'F TRI - ALB', 'A BUD - GAL'): 0.014610897224794223, ('A VIE - TYR', 'F TRI - ALB', 'A BUD - SER'): 0.012610567447009415}, 
+        # input()
+        # print("policy", policy)
 
         if self.rescoring_blueprint_model is not None:
+            #无
+            #如配置 再用另一套 BP 模型重打分。
             policy = self.order_sampler.rescore_actions_base_strategy_model(
                 game,
                 has_press=self.has_press,
@@ -646,7 +733,10 @@ class SearchBotAgent(BaseSearchAgent):
             self.order_sampler.log_orders(game, policy, label="AFTER BP-rescoring")
 
         # If we are exploiting an agent, compute their policy and replace the blueprint
-        # with their known average policy.
+        # with their known average policy.# 如果我们正在利用？？某个代理（把他当敌人吗），计算他们的策略，并将蓝图替换为他们已知的平均策略。
+        # print(self.exploited_agent_power)
+        # input()
+        # 无
         if self.exploited_agent_power is not None:
             exploited_policy = collections.defaultdict(float)
             per_sample_weight = 1.0 / self.exploited_agent_num_samples
@@ -665,6 +755,11 @@ class SearchBotAgent(BaseSearchAgent):
             policy[self.exploited_agent_power] = exploited_policy
 
         # Inference time double oracle or other augmentation.
+        # print("allow_augment", allow_augment)
+        # input()
+        # 有 但扩展的啥？？
+        # 这是“在推理期做动作集增强”，把原来 bp_policy 的候选集再扩一圈，以免漏掉潜在好动作。
+        # print("policy_before_augment", policy)
         if allow_augment:
             with temp_redefine(self.base_strategy_model_rollouts, "max_rollout_length", 0):
                 with temp_redefine(self, "cache_rollout_results", True):
@@ -690,7 +785,8 @@ class SearchBotAgent(BaseSearchAgent):
                         len(new_actions),
                         action,
                     )
-
+        # print("policy_after_augment", policy)
+        # input()
         return policy
 
     def use_br_correlated_search(self, phase: str, mode: str):
@@ -716,22 +812,22 @@ class SearchBotAgent(BaseSearchAgent):
         agent_power: Optional[Power] = None,
         agent_state: Optional[AgentState],
     ) -> CFRResult:
-        """Computes an equilibrium policy for all powers.
+        """Computes an equilibrium policy for all powers.计算所有势力的均衡策略。
 
         Arguments:
-            - game: Game object encoding current game state.
-            - bp_policy: If set, overrides the plausible order set and blueprint policy for initialization.
-                         Values should be probabilities, but can be set to -1 to simply specify plausible orders;
-                         in that case, this function will raise an error if any feature uses the BP distribution (e.g. bp_iters > 0)
-            - early_exit_for_power: If set, then if this power has <= 1 plausible order, will exit early without computing a full equilibrium.
-            - timings: A TimingCtx object to measure timings
-            - extra_plausible_orders: Extra plausible orders to add to the base_strategy_model-computed set.
-            - agent_power: Optionally, specify which agent is computing the equilibrium.
-                           Used by parlai plausible order generation, as well as advanced features like bilateral strategy.
+            - game: Game object encoding current game state.编码当前游戏状态的游戏对象。
+            - bp_policy: If set, overrides the plausible order set and blueprint policy for initialization.如果设置，则覆盖初始化时的合理顺序集和蓝图策略。
+                         Values should be probabilities, but can be set to -1 to simply specify plausible orders;值应为概率，但可以设置为 -1 以仅指定合理顺序；
+                         in that case, this function will raise an error if any feature uses the BP distribution (e.g. bp_iters > 0)在这种情况下，如果任何功能使用蓝图分布（例如 bp_iters > 0），则此函数将引发错误。
+            - early_exit_for_power: If set, then if this power has <= 1 plausible order, will exit early without computing a full equilibrium.如果设置，则如果此势力的合理顺序小于等于 1，则会提前退出，而不计算完整的均衡。
+            - timings: A TimingCtx object to measure timings用于测量时间的 TimingCtx 对象。
+            - extra_plausible_orders: Extra plausible orders to add to the base_strategy_model-computed set.要添加到 base_strategy_model 计算集的额外合理顺序。
+            - agent_power: Optionally, specify which agent is computing the equilibrium.可选，指定哪个代理正在计算均衡。
+                           Used by parlai plausible order generation, as well as advanced features like bilateral strategy.用于 parlai 合理顺序生成以及高级策略。双边战略等特征。
 
         Returns:
             - CFRResult object:
-                - avg_policies: {pwr: avg_policy} for each power
+                - avg_policies: {pwr: avg_policy} for each power每个大国的平均政策（pwr: avg_policy）
                 - final_policies: {pwr: avg_policy} for each power
                 - cfr_data: detailed internal information from the CFR procedure
         """
@@ -744,6 +840,7 @@ class SearchBotAgent(BaseSearchAgent):
         )
 
         # If there are no locations to order, bail
+        # 如果这个国家没有可下命令的地方，就退出
         if early_exit_for_power and len(game.get_orderable_locations()[early_exit_for_power]) == 0:
             if agent_power is not None:
                 assert early_exit_for_power == agent_power
@@ -756,19 +853,23 @@ class SearchBotAgent(BaseSearchAgent):
         )
 
         if bp_policy is None:
+            # 载入蓝图策略
             bp_policy = self.get_plausible_orders_policy(
                 game,
                 agent_power=agent_power,
                 agent_state=agent_state,
                 player_rating=self.player_rating if self.set_player_rating else None,
             )
-
+        # extra_plausible_orders 额外的很合理命令顺序， 目前看来这个算法里没有
+        # print("extra_plausible_orders", extra_plausible_orders)
+        # input()
         if extra_plausible_orders:
             for p, orders in extra_plausible_orders.items():
                 for order in orders:
                     bp_policy[p].setdefault(order, 0.0)
                 logging.info(f"Adding extra plausible orders {p}: {orders}")
 
+        # 用蓝图策略构建 CFRData
         cfr_data = CFRData(
             bp_policy,
             use_optimistic_cfr=self.use_optimistic_cfr,
@@ -1273,6 +1374,7 @@ class SearchBotAgent(BaseSearchAgent):
             logging.info(f"My old pseudo: {last_pseudo_orders[power]}")
             logging.info(f"My new pseudo: {pseudo_orders[power]}")
 
+    # 感觉没用
     def generate_message(
         self,
         game: Game,
@@ -1710,6 +1812,7 @@ class SearchBotAgent(BaseSearchAgent):
 
         return PseudoOrders(rollout_pseudo_orders)
 
+    # 也许no-press可以不用！！
     def maybe_get_incremental_bp(
         self,
         game: Game,
@@ -1720,30 +1823,40 @@ class SearchBotAgent(BaseSearchAgent):
         policy_top_n: int = -1,
     ) -> Optional[PowerPolicies]:
 
+      # maybe_get_incremental_bp 用来在“已经有上一轮搜索结果”的情况下，复用上一次的蓝图策略，只对“被新消息影响的阵营”或者“新加的候选 order”做增量更新，从而避免每次都从零跑一遍 plausible orders+蓝图策略。
+
+       # 也就是：如果可以增量更新，就返回一份新的蓝图 bp_policy；如果不合适增量，就返回 None，让后面直接用 get_plausible_orders_policy 从头算。
+
         if extra_plausible_orders is None:
             extra_plausible_orders = {}
+        # 如果没有上一轮的 search 结果，或者配置里关了 do_incremental_search，
+        #  直接返回 None，表示“别增量了，从头算”。
 
         last_search_result = agent_state.get_last_search_result(game)
         if last_search_result is None or not self.do_incremental_search:
             return None
 
-        # If this is a "rollout" phase we can't guarantee that the game state is the same as
+        # If this is a "rollout" phase we can't guarantee that the game state is the same as 用 last_dialogue_phase + current_short_phase 来区分：“当前是否处在跟上次搜索同一个对话阶段的真实局面”，还是已经进入了某种 rollout / 模拟状态（状态可能和上次搜索时不同）
         # last time. We could try to be careful but lets just bail.
+        # 如果对话 phase 不一样了，说明局面可能已经变了（例如时间推进、rollouts 回放过很多东西）
+        # → 不敢保证上次的蓝图仍然合理
+        # → 增量有风险，直接返回 None，让系统重新生成蓝图。
         last_dialogue_phase = game.get_metadata("last_dialogue_phase")
         if last_dialogue_phase and last_dialogue_phase != game.current_short_phase:
             return None
 
-        recent_messages = agent_state.get_new_messages(game)
+        recent_messages = agent_state.get_new_messages(game)  #把“有新消息的势力”挑出来
 
         powers_to_update = set([m["sender"] for m in recent_messages]) | set(
             [m["recipient"] for m in recent_messages]
         )
         powers_to_update &= set(POWERS)  # don't allow ALL
-        last_bp = last_search_result.get_bp_policy()
-        last_agent_policy = last_search_result.get_agent_policy()
-        last_pop_policy = last_search_result.get_population_policy()
+        last_bp = last_search_result.get_bp_policy() #last_bp：蓝图策略（PlausibleOrderSampler 算出来的 BP 分布）
+        last_agent_policy = last_search_result.get_agent_policy() #last_agent_policy：CFR 后这个 agent 使用的策略（最重要）
+        last_pop_policy = last_search_result.get_population_policy() # last_pop_policy：CFR 后“策略族”的 population policy（对别的 agent 视角）
 
         # only take the top N actions by probability in the search population
+        # 4. “截断”一下：只保留 top-N 动作（可选）
         if policy_top_n > 0:
             last_bp_thinned = {
                 pwr: {
@@ -1763,10 +1876,12 @@ class SearchBotAgent(BaseSearchAgent):
         # if policy_top_n is not set. We can't cut it off after incremental_update
         # because we don't want to remove the extra plausible orders.
         # # So lets just cut it off here.
+        # 即使 policy_top_n 没设，多轮增量更新 + 对话加入新动作 会导致动作集合不断膨胀；但又不能在 incremental_update_policy 后随便砍掉动作（因为可能刚刚加了一些 extra orders）；所以选择在这里用 cutoff_policy 按 limits 做一次统一截断。
         limits = self.order_sampler.get_plausible_order_limits(game)
         last_bp_thinned = cutoff_policy(last_bp_thinned, limits)
 
         for pwr, actions in extra_plausible_orders.items():
+             # 某些情况下，调用方（上层）想强行把一些动作“塞入 plausible 集合”
             for a in actions:
                 if a in last_bp[pwr] and not recent_messages:
                     # can use the cached BP prob
@@ -1784,7 +1899,7 @@ class SearchBotAgent(BaseSearchAgent):
             agent_power,
             powers=list(powers_to_update),
             parlai_req_size=parlai_req_size if recent_messages else 0,
-        )
+        ) # 真正的“增量更新” 只更新 powers_to_update 中的国家、如果没有新消息，就不问 ParlAI
 
     def try_get_cached_search_result(
         self, game: Game, state: SearchBotAgentState
@@ -1794,9 +1909,7 @@ class SearchBotAgent(BaseSearchAgent):
         return None
 
     def can_sleep(self) -> bool:
-        ## 【1127为了报错AssertionError: All players must sleep, or none改的】
-        return False
-        # return self.message_handler is not None and self.message_handler.has_sleep_classifier()
+        return self.message_handler is not None and self.message_handler.has_sleep_classifier()
 
     def get_sleep_time(
         self, game: Game, power: Power, state: AgentState, recipient: Optional[Power] = None,
@@ -2060,6 +2173,10 @@ def augment_plausible_orders(
 ) -> PowerPolicies:
     policy_model = agent.base_strategy_model.model
     augmentation_type = cfg.which_augmentation_type
+    # print("augmentation_type", augmentation_type)
+    # input()
+    # searchbot的初始augmentation_type是None
+    # 似乎整个项目也没扩展...搜了augmentation_type 只有一个agents.proto有这个参数
     if augmentation_type is None:
         return power_plausible_orders
     if not game.current_short_phase.endswith("M"):

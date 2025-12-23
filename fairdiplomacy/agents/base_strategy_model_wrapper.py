@@ -67,16 +67,29 @@ class BaseStrategyModelWrapper:
 
         self.model_path = model_path
         self.model = load_model(model_path)
+        
         self.value_model = load_model(value_model_path) if value_model_path else self.model
         self.device = device
         self.feature_encoder = FeatureEncoder()
         self.max_batch_size = max_batch_size
         self.half_precision = half_precision
         self.force_disable_all_power = force_disable_all_power
-        if half_precision:
+        # if half_precision:
+        #     self.model.half()
+        #     if self.value_model is not self.model:
+        #         self.value_model.half()
+        # ===== 先处理CPU的FP32转换(因为模型可能从文件加载就是FP16) =====
+        if device == "cpu":
+            logging.warning("Running on CPU, converting model to FP32")
+            self.model = self.model.float()
+            if self.value_model is not self.model:
+                self.value_model = self.value_model.float()
+        # ===== 然后再处理GPU的half_precision =====
+        elif half_precision:
             self.model.half()
             if self.value_model is not self.model:
                 self.value_model.half()
+        
         self.debug_always_resample_multi_disbands = False
 
     def get_policy_input_version(self) -> int:
@@ -474,6 +487,10 @@ def resample_duplicate_disbands_inplace(
     if batch_repeat_interleave is not None:
         assert x_in_adj_phase.size()[0] * batch_repeat_interleave == local_order_idxs.size()[0]
         x_in_adj_phase = x_in_adj_phase.repeat_interleave(batch_repeat_interleave, dim=0)
+        # 在 CPU 上，Half 的 repeat_interleave / index_select 不支持，先转成 float32【1127解决GPU问题】
+        # x_in_adj_phase = x_in_adj_phase.float()
+        # x_in_adj_phase = x_in_adj_phase.repeat_interleave(batch_repeat_interleave, dim=0)
+
     multi_disband_powers_mask = (
         local_order_idxs[:, :, 1] != EOS_IDX
     ) & x_in_adj_phase.bool().unsqueeze(1)
