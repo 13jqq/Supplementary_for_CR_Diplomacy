@@ -1025,5 +1025,6 @@ message Agent {
     BQRE1PAgent bqre1p = 15;
     TheBestAgent best_agent = 18;
     BQRE1PAgent coo_agent = 13;
+    BQRE1PAgent consistent_agent = 14;
   }
 }

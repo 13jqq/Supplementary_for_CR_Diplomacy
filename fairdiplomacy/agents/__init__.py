@@ -20,6 +20,7 @@ def build_agent_from_cfg(agent_stanza: "conf.agents_cfgs.Agent", **redefines) ->
     from .bqre1p_agent import BQRE1PAgent
     from .the_best_agent import TheBestAgent
     from .coo_agent1201 import CooAgent
+    from .consistent_agent import ConsistentAgent
 
     AGENT_CLASSES = {
         "br_search": BRSearchAgent,
@@ -32,6 +33,7 @@ def build_agent_from_cfg(agent_stanza: "conf.agents_cfgs.Agent", **redefines) ->
         "parlai_full_press": ParlaiFullPressAgent,
         "best_agent": TheBestAgent,
         "coo_agent":CooAgent,
+        "consistent_agent":ConsistentAgent,
     }
 
     which_agent = agent_stanza.which_agent
