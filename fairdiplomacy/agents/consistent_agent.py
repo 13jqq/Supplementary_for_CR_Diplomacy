@@ -5,6 +5,7 @@ import random
 from typing import Any, Dict, List, Tuple
 import heyhi
 from fairdiplomacy.agents.bqre1p_agent import BQRE1PAgent
+from fairdiplomacy.utils.sampling import sample_p_dict
 
 POWERS = ["AUSTRIA", "ENGLAND", "FRANCE", "GERMANY", "ITALY", "RUSSIA", "TURKEY"]
 
@@ -78,7 +79,7 @@ class ConsistentAgent(BQRE1PAgent):
         # 2.3) source == "bp"：保持 dist 为 bp
 
         if not dist:
-            return [], [], used_source
+            return [], [], used_source, []
 
         # 3) 截取 top-k 候选列表（关键：保留 items，后面我们就在这里做一致性校验）
         items = sorted(dist.items(), key=lambda kv: kv[1], reverse=True)
@@ -92,27 +93,45 @@ class ConsistentAgent(BQRE1PAgent):
         # TODO（下一步实现）：从 items[0], items[1], ... 往下找“一致性通过校验”的 action
         # 目前骨架版：暂时仍然选 top1 / 或按概率 sample（方便你先跑通流程 + 打印 items）
 
-        if mode == "top1":
-            action = items[0][0]
-        else:
-            weights = [max(0.0, p) for _, p in items]
-            s = sum(weights)
-            if s <= 0:
-                action = random.choice([a for a, _ in items])
+
+        pool = items  # items 已经是 kept(优先) 或 fallback 后的列表
+
+        # ✅ 用这段替换你原来的 if mode == "top1" ... else ...
+        if mode in ("sample", "bqre"):
+            dist2 = _renorm(pool)
+            if dist2 is None:
+                action = random.choice([a for a, _ in pool])
             else:
-                r = random.random() * s
-                cum = 0.0
-                action = items[-1][0]
-                for (a, _), w in zip(items, weights):
-                    cum += w
-                    if cum >= r:
-                        action = a
-                        break
+                action = sample_p_dict(dist2)   # BQRE-style sampling
+        else:
+            action = max(pool, key=lambda kv: kv[1])[0]  # top1
+
+        # if mode == "top1":
+        #     action = items[0][0]
+        # else:
+        #     weights = [max(0.0, p) for _, p in items]
+        #     s = sum(weights)
+        #     if s <= 0:
+        #         action = random.choice([a for a, _ in items])
+        #     else:
+        #         r = random.random() * s
+        #         cum = 0.0
+        #         action = items[-1][0]
+        #         for (a, _), w in zip(items, weights):
+        #             cum += w
+        #             if cum >= r:
+        #                 action = a
+        #                 break
 
         orders = list(action) if isinstance(action, (list, tuple)) else [action]
         return orders, items, used_source, dropped
 
-
+def _renorm_action_items(items):
+    d = {a: max(0.0, float(p)) for a, p in items}
+    s = sum(d.values())
+    if s <= 0:
+        return None
+    return {a: p / s for a, p in d.items()}
 def load_cicero(cfg_path: str, *, skip_cache: bool = False) -> ConsistentAgent:
     """
     从 consistent_agent.prototxt 读取配置并构造 ConsistentAgent（BQRE1PAgent-based）

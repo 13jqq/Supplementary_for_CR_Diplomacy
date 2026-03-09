@@ -1298,9 +1298,14 @@ if __name__ == "__main__":
     #     / "conf/common/agents/bqre1p_20210723.prototxt",
     #     overrides=["bqre1p.base_searchbot_cfg.n_rollouts=64"] + sys.argv[1:],
     # )
+    # cfg = heyhi.load_config(
+    #     pathlib.Path(__file__).resolve().parents[2]
+    #     / "conf/common/agents/for_tests/bqre1p_20210821_rol0.prototxt",
+    #     overrides=["bqre1p.base_searchbot_cfg.n_rollouts=64"] + sys.argv[1:],
+    # )
     cfg = heyhi.load_config(
         pathlib.Path(__file__).resolve().parents[2]
-        / "conf/common/agents/for_tests/bqre1p_20210821_rol0.prototxt",
+        / "conf/common/agents/cicero_nopress.prototxt",
         overrides=["bqre1p.base_searchbot_cfg.n_rollouts=64"] + sys.argv[1:],
     )
 

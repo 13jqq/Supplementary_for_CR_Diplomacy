@@ -22,6 +22,7 @@ def build_agent_from_cfg(agent_stanza: "conf.agents_cfgs.Agent", **redefines) ->
     from .coo_agent1201 import CooAgent
     from .consistent_agent import ConsistentAgent
 
+
     AGENT_CLASSES = {
         "br_search": BRSearchAgent,
         "base_strategy_model": BaseStrategyModelAgent,
