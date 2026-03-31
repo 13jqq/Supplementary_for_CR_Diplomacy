@@ -9,140 +9,346 @@ from fairdiplomacy.utils.sampling import sample_p_dict
 
 POWERS = ["AUSTRIA", "ENGLAND", "FRANCE", "GERMANY", "ITALY", "RUSSIA", "TURKEY"]
 
-
 class ConsistentAgent(BQRE1PAgent):
     """
-    一致性校验智能体（骨架版）
+    一致性校验智能体
 
-    目标效果：在 Cicero/BQRE 给出的 top-k action 中，不直接用 top1，
-            而是保留候选列表，后续我们将从 top 往下找“动作一致性更强”的 action。
-
-    输出：choose_orders 返回 (orders, items, used_source)
-         - orders: 最终选中的 orders(list[str])
-         - items : top-k 候选 action 列表 [(action, prob), ...]（用于后续一致性筛选）
-         - used_source: "bp" / "search_br" / "bqre_topK"
+    对外暴露两个接口：
+      1) get_orders(...): 标准 agent 接口，只返回最终 orders
+      2) get_orders_info(...): 返回详细信息，供 runner 记日志
     """
 
-    def choose_orders(
+    def get_orders_info(
         self,
-        game: "Any",          # pydipcc.Game
+        game: Any,
         power: str,
-        agent_state: Any,
+        state: Any,
         *,
-        source: str = "bqre_topK",   # ✅ 新增：默认走 bqre_topK（多 action 分布）
+        source: str = "bqre_topK",
         top_k: int = 30,
-        mode: str = "top1",          # "top1" 或 "sample"
-    ) -> Tuple[List[str], List[Tuple[Any, float]], str, List[Tuple[Any, float, str]]]:
-        # 1) 先拿 blueprint plausible joint-action 分布（Cicero 原流程）
+        mode: str = "bqre",
+    ) -> Dict[str, Any]:
+        """
+        输出:
+        {
+            "orders": List[str],
+            "items": List[(action, prob)],         # 过滤后保留的候选
+            "raw_items": List[(action, prob)],     # 过滤前 top-k 候选
+            "used_source": str,                    # "bp" / "search_br" / "bqre_topK"
+            "dropped": List[(action, prob, reason)]
+        }
+        """
+
+        # 1) blueprint policy
         bp_policy: Dict[str, Dict[Any, float]] = self.get_plausible_orders_policy(
             game=game,
             agent_power=power,
-            agent_state=agent_state,
+            agent_state=state,
         )
         dist: Dict[Any, float] = bp_policy.get(power, {}) or {}
         used_source = "bp"
 
-        # 2) 三种来源可选：bqre_topK / search_br / bp
-        # 2.1) ✅ 新增：bqre_topK —— 直接跑 BQRE 的 run_search 拿多 action 分布（推荐）
+        # 2) choose source
         if source == "bqre_topK":
             try:
-                # 复用已算出的 bp_policy，避免重复计算 plausible orders
                 res = self.run_search(
                     game,
                     bp_policy=bp_policy,
                     agent_power=power,
-                    agent_state=agent_state,
+                    agent_state=state,
                 )
                 dist = res.get_agent_policy().get(power, {}) or {}
                 used_source = "bqre_topK"
             except Exception:
-                # 失败则回退 bp
                 dist = bp_policy.get(power, {}) or {}
                 used_source = "bp"
 
-        # 2.2) 保留原逻辑：search_br —— correlated BR（通常只给 best action 分布，可能退化）
         elif source == "search_br":
             try:
                 search_res = self.run_best_response_against_correlated_bilateral_search(
                     game=game,
                     agent_power=power,
                     bp_policy=bp_policy,
-                    agent_state=agent_state,
+                    agent_state=state,
                 )
                 agent_pols = search_res.get_agent_policy()
                 if agent_pols.get(power):
                     dist = agent_pols[power]
                     used_source = "search_br"
             except Exception:
+                dist = bp_policy.get(power, {}) or {}
                 used_source = "bp"
 
-        # 2.3) source == "bp"：保持 dist 为 bp
+        # source == "bp" 时保持 blueprint
 
         if not dist:
-            return [], [], used_source, []
+            return {
+                "orders": [],
+                "items": [],
+                "raw_items": [],
+                "used_source": used_source,
+                "dropped": [],
+            }
 
-        # 3) 截取 top-k 候选列表（关键：保留 items，后面我们就在这里做一致性校验）
-        items = sorted(dist.items(), key=lambda kv: kv[1], reverse=True)
+        # 3) top-k raw candidates
+        raw_items = sorted(dist.items(), key=lambda kv: kv[1], reverse=True)
         if top_k is not None and top_k > 0:
-            items = items[:top_k]
+            raw_items = raw_items[:top_k]
 
-        kept, dropped = filter_action_set_by_consistency(game, power, items)
-        items = kept if kept else items   # kept 为空则回退
+        # 4) consistency filter
+        kept, dropped = filter_action_set_by_consistency(game, power, raw_items)
+        items = kept if kept else raw_items
 
-
-        # TODO（下一步实现）：从 items[0], items[1], ... 往下找“一致性通过校验”的 action
-        # 目前骨架版：暂时仍然选 top1 / 或按概率 sample（方便你先跑通流程 + 打印 items）
-
-
-        pool = items  # items 已经是 kept(优先) 或 fallback 后的列表
-
-        # ✅ 用这段替换你原来的 if mode == "top1" ... else ...
-        if mode in ("sample", "bqre"):
-            dist2 = _renorm(pool)
-            if dist2 is None:
-                action = random.choice([a for a, _ in pool])
-            else:
-                action = sample_p_dict(dist2)   # BQRE-style sampling
-        else:
-            action = max(pool, key=lambda kv: kv[1])[0]  # top1
-
-        # if mode == "top1":
-        #     action = items[0][0]
-        # else:
-        #     weights = [max(0.0, p) for _, p in items]
-        #     s = sum(weights)
-        #     if s <= 0:
-        #         action = random.choice([a for a, _ in items])
-        #     else:
-        #         r = random.random() * s
-        #         cum = 0.0
-        #         action = items[-1][0]
-        #         for (a, _), w in zip(items, weights):
-        #             cum += w
-        #             if cum >= r:
-        #                 action = a
-        #                 break
+        # 5) select final action
+        action = self._select_action_from_items(items, mode=mode)
 
         orders = list(action) if isinstance(action, (list, tuple)) else [action]
-        return orders, items, used_source, dropped
+        return {
+            "orders": orders,
+            "items": items,
+            "raw_items": raw_items,
+            "used_source": used_source,
+            "dropped": dropped,
+        }
 
-def _renorm_action_items(items):
+    def get_orders(
+        self,
+        game: Any,
+        power: str,
+        state: Any,
+        *,
+        source: str = "bqre_topK",
+        top_k: int = 30,
+        mode: str = "bqre",
+    ) -> List[str]:
+        """
+        标准 agent 接口：只返回最终 orders
+        """
+        info = self.get_orders_info(
+            game=game,
+            power=power,
+            state=state,
+            source=source,
+            top_k=top_k,
+            mode=mode,
+        )
+        return info["orders"]
+
+    def _select_action_from_items(
+        self,
+        items: List[Tuple[Any, float]],
+        *,
+        mode: str = "bqre",
+    ) -> Any:
+        if not items:
+            return []
+
+        if mode in ("sample", "bqre"):
+            dist = _renorm_action_items(items)
+            if dist is None:
+                return random.choice([a for a, _ in items])
+            return sample_p_dict(dist)
+
+        return max(items, key=lambda kv: kv[1])[0]
+    CHECK_ORDER = ("C1", "C2", "C3", "C4")
+
+    def audit_final_orders(
+        self,
+        game: Any,
+        power: str,
+        orders: Any,  # list[str] / tuple[str] / str
+        *,
+        check_order: Tuple[str, ...] = CHECK_ORDER,
+    ) -> Dict[str, Any]:
+        """
+        回合结束（orders 已确定）后的审计接口：只检查最终 action 是否触发 C1~C4。
+        返回:
+        {
+          "power": str,
+          "tag": "C1"|"C2"|"C3"|"C4"|"NONE",
+          "reason": str,
+          "ok": bool,
+        }
+        """
+        action = self._normalize_action(orders)
+
+        # 注意：这里直接复用你文件里已有的 check_c1~c4 函数
+        #（假设它们在同一个 consistent_agent.py 中可见）
+        checks = {
+            "C1": check_c1_intra_turn_consistency,
+            "C2": check_c2_inter_turn_consistency,
+            "C3": check_c3_destination_conflict,
+            "C4": check_c4_self_defense_consistency,
+        }
+
+        violations: List[Tuple[str, str]] = []
+
+        for k in check_order:
+            fn = checks.get(k)
+            if fn is None:
+                continue
+
+            ok, reason = fn(game, power, action)  # power 作为 my_power 传入
+            if not ok:
+                violations.append((k, reason))
+
+        return {
+            "power": power,
+            "ok": (len(violations) == 0),
+            "violations": violations,  # e.g. [("C1", "..."), ("C3", "...")]
+        }
+
+    @staticmethod
+    def _normalize_action(orders: Any) -> Tuple[str, ...]:
+        if orders is None:
+            return tuple()
+        if isinstance(orders, tuple):
+            return tuple(str(x) for x in orders)
+        if isinstance(orders, list):
+            return tuple(str(x) for x in orders)
+        if isinstance(orders, str):
+            return (orders,)
+        try:
+            return tuple(str(x) for x in orders)
+        except Exception:
+            return (str(orders),)
+# class ConsistentAgent(BQRE1PAgent):
+#     """
+#     一致性校验智能体（骨架版）
+
+#     目标效果：在 Cicero/BQRE 给出的 top-k action 中，不直接用 top1，
+#             而是保留候选列表，后续我们将从 top 往下找“动作一致性更强”的 action。
+
+#     输出：choose_orders 返回 (orders, items, used_source)
+#          - orders: 最终选中的 orders(list[str])
+#          - items : top-k 候选 action 列表 [(action, prob), ...]（用于后续一致性筛选）
+#          - used_source: "bp" / "search_br" / "bqre_topK"
+#     """
+
+#     def choose_orders(
+#         self,
+#         game: "Any",          # pydipcc.Game
+#         power: str,
+#         agent_state: Any,
+#         *,
+#         source: str = "bqre_topK",   # ✅ 新增：默认走 bqre_topK（多 action 分布）
+#         top_k: int = 30,
+#         mode: str = "top1",          # "top1" 或 "sample"
+#     ) -> Tuple[List[str], List[Tuple[Any, float]], str, List[Tuple[Any, float, str]]]:
+#         # 1) 先拿 blueprint plausible joint-action 分布（Cicero 原流程）
+#         bp_policy: Dict[str, Dict[Any, float]] = self.get_plausible_orders_policy(
+#             game=game,
+#             agent_power=power,
+#             agent_state=agent_state,
+#         )
+#         dist: Dict[Any, float] = bp_policy.get(power, {}) or {}
+#         used_source = "bp"
+
+#         # 2) 三种来源可选：bqre_topK / search_br / bp
+#         # 2.1) ✅ 新增：bqre_topK —— 直接跑 BQRE 的 run_search 拿多 action 分布（推荐）
+#         if source == "bqre_topK":
+#             try:
+#                 # 复用已算出的 bp_policy，避免重复计算 plausible orders
+#                 res = self.run_search(
+#                     game,
+#                     bp_policy=bp_policy,
+#                     agent_power=power,
+#                     agent_state=agent_state,
+#                 )
+#                 dist = res.get_agent_policy().get(power, {}) or {}
+#                 used_source = "bqre_topK"
+#             except Exception:
+#                 # 失败则回退 bp
+#                 dist = bp_policy.get(power, {}) or {}
+#                 used_source = "bp"
+
+#         # 2.2) 保留原逻辑：search_br —— correlated BR（通常只给 best action 分布，可能退化）
+#         elif source == "search_br":
+#             try:
+#                 search_res = self.run_best_response_against_correlated_bilateral_search(
+#                     game=game,
+#                     agent_power=power,
+#                     bp_policy=bp_policy,
+#                     agent_state=agent_state,
+#                 )
+#                 agent_pols = search_res.get_agent_policy()
+#                 if agent_pols.get(power):
+#                     dist = agent_pols[power]
+#                     used_source = "search_br"
+#             except Exception:
+#                 used_source = "bp"
+
+#         # 2.3) source == "bp"：保持 dist 为 bp
+
+#         if not dist:
+#             return [], [], used_source, []
+
+#         # 3) 截取 top-k 候选列表（关键：保留 items，后面我们就在这里做一致性校验）
+#         items = sorted(dist.items(), key=lambda kv: kv[1], reverse=True)
+#         if top_k is not None and top_k > 0:
+#             items = items[:top_k]
+
+#         kept, dropped = filter_action_set_by_consistency(game, power, items)
+#         items = kept if kept else items   # kept 为空则回退
+
+
+#         # TODO（下一步实现）：从 items[0], items[1], ... 往下找“一致性通过校验”的 action
+#         # 目前骨架版：暂时仍然选 top1 / 或按概率 sample（方便你先跑通流程 + 打印 items）
+
+
+#         pool = items  # items 已经是 kept(优先) 或 fallback 后的列表
+
+#         # ✅ 用这段替换你原来的 if mode == "top1" ... else ...
+#         if mode in ("sample", "bqre"):
+#             dist2 = _renorm(pool)
+#             if dist2 is None:
+#                 action = random.choice([a for a, _ in pool])
+#             else:
+#                 action = sample_p_dict(dist2)   # BQRE-style sampling
+#         else:
+#             action = max(pool, key=lambda kv: kv[1])[0]  # top1
+
+#         # if mode == "top1":
+#         #     action = items[0][0]
+#         # else:
+#         #     weights = [max(0.0, p) for _, p in items]
+#         #     s = sum(weights)
+#         #     if s <= 0:
+#         #         action = random.choice([a for a, _ in items])
+#         #     else:
+#         #         r = random.random() * s
+#         #         cum = 0.0
+#         #         action = items[-1][0]
+#         #         for (a, _), w in zip(items, weights):
+#         #             cum += w
+#         #             if cum >= r:
+#         #                 action = a
+#         #                 break
+
+#         orders = list(action) if isinstance(action, (list, tuple)) else [action]
+#         return orders, items, used_source, dropped
+
+def _renorm_action_items(items: List[Tuple[Any, float]]) -> Dict[Any, float] | None:
     d = {a: max(0.0, float(p)) for a, p in items}
     s = sum(d.values())
     if s <= 0:
         return None
     return {a: p / s for a, p in d.items()}
-def load_cicero(cfg_path: str, *, skip_cache: bool = False) -> ConsistentAgent:
+
+# def _renorm_action_items(items):
+#     d = {a: max(0.0, float(p)) for a, p in items}
+#     s = sum(d.values())
+#     if s <= 0:
+#         return None
+#     return {a: p / s for a, p in d.items()}
+
+
+def load_consistent_agent(cfg_path: str, *, skip_cache: bool = False) -> ConsistentAgent:
     """
-    从 consistent_agent.prototxt 读取配置并构造 ConsistentAgent（BQRE1PAgent-based）
-    目标效果：复用你现有“配置文件挂载 + agent 映射”那套流程，只是换成 consistent_agent。
-    输出：ConsistentAgent 实例
+    从 consistent_agent.prototxt 读取配置并构造 ConsistentAgent
     """
     full_cfg = heyhi.load_config(cfg_path)
 
-    # 兼容两种常见配置结构：
-    # 1) full_cfg.agent.consistent_agent
-    # 2) full_cfg.consistent_agent
     if hasattr(full_cfg, "agent") and hasattr(full_cfg.agent, "consistent_agent"):
         agent_cfg = full_cfg.agent.consistent_agent
     elif hasattr(full_cfg, "consistent_agent"):
@@ -151,6 +357,8 @@ def load_cicero(cfg_path: str, *, skip_cache: bool = False) -> ConsistentAgent:
         raise ValueError(f"Bad config structure in {cfg_path}: cannot find consistent_agent")
 
     return ConsistentAgent(agent_cfg, skip_base_strategy_model_cache=skip_cache)
+
+
 # ====== 新增函数 1：位置规范化（只去掉 *，保留 /SC /NC /EC 等后缀）======
 def _norm_loc(loc: str | None) -> str | None:
     if not loc:
@@ -374,6 +582,13 @@ def check_c1_intra_turn_consistency(
     """
 
     # --- 取 state（只取一次）---
+    # 只在 Movement phase 生效（默认）
+    try:
+        cur_phase = str(game.get_current_phase()).upper()
+    except Exception:
+        cur_phase = ""
+    if not cur_phase.endswith("M"):
+        return True, ""
     try:
         st = game.get_state()
     except Exception:
@@ -927,285 +1142,285 @@ def filter_action_set_by_consistency(
 
 
 
-def main():
-    """
-    用 consistent_agent 跑一个 dipcc game：
-    - 每个 phase：对指定 power（例如 AUSTRIA）调用 choose_orders 拿到 top-k items
-    - 把 items（p, action）写到 log，便于你核对候选动作列表是否正确
-    - 其他国家用 blueprint 的 top1（或随机）补齐 orders，保证 game.process() 能跑
-    输出：
-      - 生成一个 .log 文件，包含每步 phase、source、topk actions
-    """
-    import argparse
-    import os
-    from datetime import datetime
-    from fairdiplomacy import pydipcc
+# def main():
+#     """
+#     用 consistent_agent 跑一个 dipcc game：
+#     - 每个 phase：对指定 power（例如 AUSTRIA）调用 choose_orders 拿到 top-k items
+#     - 把 items（p, action）写到 log，便于你核对候选动作列表是否正确
+#     - 其他国家用 blueprint 的 top1（或随机）补齐 orders，保证 game.process() 能跑
+#     输出：
+#       - 生成一个 .log 文件，包含每步 phase、source、topk actions
+#     """
+#     import argparse
+#     import os
+#     from datetime import datetime
+#     from fairdiplomacy import pydipcc
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--cfg", type=str, default="conf/common/agents/consistent_agent.prototxt")
-    parser.add_argument("--project_root", type=str, default="/workspace/Diplomacy/diplomacy_cicero")
-    parser.add_argument("--power", type=str, default="AUSTRIA", choices=POWERS)
-    parser.add_argument("--seed", type=int, default=0)
+#     parser = argparse.ArgumentParser()
+#     parser.add_argument("--cfg", type=str, default="conf/common/agents/consistent_agent.prototxt")
+#     parser.add_argument("--project_root", type=str, default="/workspace/Diplomacy/diplomacy_cicero")
+#     parser.add_argument("--power", type=str, default="AUSTRIA", choices=POWERS)
+#     parser.add_argument("--seed", type=int, default=0)
 
-    # ✅ 修改：默认走 bqre_topK，并把 choices 加上 bqre_topK
-    parser.add_argument("--source", type=str, default="bqre_topK",
-                        choices=["bqre_topK", "search_br", "bp"])
-    parser.add_argument("--mode", type=str, default="top1", choices=["top1", "sample"])
-    parser.add_argument("--topk", type=int, default=30)
-    parser.add_argument("--max_phases", type=int, default=60)
+#     # ✅ 修改：默认走 bqre_topK，并把 choices 加上 bqre_topK
+#     parser.add_argument("--source", type=str, default="bqre_topK",
+#                         choices=["bqre_topK", "search_br", "bp"])
+#     parser.add_argument("--mode", type=str, default="top1", choices=["top1", "sample"])
+#     parser.add_argument("--topk", type=int, default=30)
+#     parser.add_argument("--max_phases", type=int, default=60)
 
-    parser.add_argument("--log_dir", type=str, default="logs_consistent")
-    parser.add_argument("--log", type=str, default=None)
+#     parser.add_argument("--log_dir", type=str, default="logs_consistent")
+#     parser.add_argument("--log", type=str, default=None)
 
-    args = parser.parse_args()
-    random.seed(args.seed)
-    # ====== 全局可复现：尽量把所有随机源都固定住 ======
-    import os
-    os.environ["PYTHONHASHSEED"] = str(args.seed)
+#     args = parser.parse_args()
+#     random.seed(args.seed)
+#     # ====== 全局可复现：尽量把所有随机源都固定住 ======
+#     import os
+#     os.environ["PYTHONHASHSEED"] = str(args.seed)
 
-    try:
-        import numpy as np
-        np.random.seed(args.seed)
-    except Exception:
-        pass
+#     try:
+#         import numpy as np
+#         np.random.seed(args.seed)
+#     except Exception:
+#         pass
 
-    try:
-        import torch
-        torch.manual_seed(args.seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(args.seed)
-        # 尽量 deterministic（可能牺牲一点速度）
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-    except Exception:
-        pass
-
-
-    # 1) 进入项目根目录（保证相对路径的模型/配置能找到）
-    if args.project_root and os.path.exists(args.project_root):
-        os.chdir(args.project_root)
-
-    # 2) log 路径
-    ts = datetime.now().strftime("%y%m%d%H%M%S")
-    log_dir = args.log_dir if os.path.isabs(args.log_dir) else os.path.join(os.getcwd(), args.log_dir)
-    os.makedirs(log_dir, exist_ok=True)
-    log_path = args.log if args.log else os.path.join(log_dir, f"consistent_{ts}.log")
-
-    # 3) 加载 agent + 初始化 game/state
-    agent = load_cicero(args.cfg, skip_cache=False)
-    game = pydipcc.Game()
-    states = {p: agent.initialize_state(p) for p in POWERS}
-
-    def _is_done(g: "pydipcc.Game") -> bool:
-        # 尽量兼容不同 dipcc binding
-        for attr in ("is_game_done", "is_game_over", "game_over"):
-            if hasattr(g, attr):
-                try:
-                    v = getattr(g, attr)
-                    return bool(v() if callable(v) else v)
-                except Exception:
-                    pass
-        ph = str(g.get_current_phase()).upper()
-        return ("COMPLETED" in ph) or (ph in {"DONE", "END"})
-
-    with open(log_path, "w", encoding="utf-8") as f:
-        f.write("=== CONSISTENT_AGENT RUN START ===\n")
-        f.write(f"cwd={os.getcwd()}\n")
-        f.write(f"cfg={args.cfg}\n")
-        f.write(f"power={args.power}, seed={args.seed}, source={args.source}, mode={args.mode}, topk={args.topk}\n\n")
-        f.flush()
-
-        step = 0
-        while step < args.max_phases and not _is_done(game):
-            phase = game.get_current_phase()
-
-             # ✅ 新增：每回合开始抓一次 state（用于 log: units / SC / territory）
-            try:
-                st = game.get_state()
-            except Exception:
-                st = {}
-            if not isinstance(st, dict) and hasattr(st, "to_dict"):
-                try:
-                    st = st.to_dict()
-                except Exception:
-                    st = {}
-            if not isinstance(st, dict):
-                st = {}
-            # 【七个国家都是bqre_topK】
-            # --- 给所有国家补齐 orders，保证能 process ---
-            set_orders: Dict[str, List[str]] = {p: [] for p in POWERS}
-
-            # 先让所有国家“在同一个 state 下”各自选单：只存，不写入 game（防止信息泄露）
-            all_infos: Dict[str, Tuple[List[Tuple[Any, float]], str, List[Tuple[Any, float, str]]]] = {}
-            tmp_orders: Dict[str, List[str]] = {}
-
-            for pwr in POWERS:
-                orders, items, used_source, dropped = agent.choose_orders(
-                    game=game,
-                    power=pwr,
-                    agent_state=states[pwr],
-                    source=args.source,
-                    top_k=args.topk,
-                    mode=args.mode,
-                )
-                tmp_orders[pwr] = orders
-                all_infos[pwr] = (items, used_source, dropped)
-
-            f.write("\n" + "=" * 90 + "\n")
-            f.write(f"[STEP {step:04d}] phase={phase}\n")
-
-            # ✅ 每回合开始时打印所有玩家 units / SC / nonSC territory（你原来的逻辑保留）
-            units = st.get("units", {}) or {}
-            centers = st.get("centers", {}) or {}
-            influence = st.get("influence", None)
-            terr_src = "influence" if isinstance(influence, dict) else "fallback"
-
-            f.write(f"[STATE BEFORE] terr_src={terr_src}\n")
-            for pwr in POWERS:
-                ulist = list((units.get(pwr) or []))
-                sc_set, unit_set, past_free_set = get_territory_parts(st, pwr)
-                terr_set = sc_set | unit_set | past_free_set
-                sc_list = sorted(sc_set)
-                non_sc = sorted(terr_set - sc_set)
-
-                f.write(
-                    f"  {pwr}: "
-                    f"units({len(ulist)})={ulist} | "
-                    f"SC({len(sc_list)})={sc_list} | "
-                    f"nonSC({len(non_sc)})={non_sc}\n"
-                )
-
-            # ✅ 打印 7 国各自的 FILTERED OUT（以及可选的 topk 列表）
-            for pwr in POWERS:
-                items, used_source, dropped = all_infos[pwr]
-                f.write(f"[AGENT] power={pwr} used_source={used_source} topk={len(items)}\n")
-
-                f.write(f"[FILTERED OUT] power={pwr} n={len(dropped)}\n")
-                for j, (a, pp, rsn) in enumerate(dropped):
-                    if isinstance(a, (list, tuple)):
-                        act_str = "[" + ", ".join(map(str, a)) + "]"
-                    else:
-                        act_str = str(a)
-                    f.write(f"  -{j:02d}  p={float(pp):.8f}  reason={rsn}  action={act_str}\n")
-
-                # 如果你也想每个国家都打印 kept 的 topk（会很长），取消注释：
-                # for i, (a, p) in enumerate(items):
-                #     act_str = "[" + ", ".join(map(str, a)) + "]" if isinstance(a, (list, tuple)) else str(a)
-                #     f.write(f"  #{i:02d}  p={float(p):.8f}  action={act_str}\n")
-
-            # ✅ 最后一次性写入 orders（避免后选国家“看见”先选国家 orders）
-            for pwr in POWERS:
-                set_orders[pwr] = tmp_orders.get(pwr, [])
-                game.set_orders(pwr, set_orders[pwr])
-
-            f.write("[ORDERS SET]\n")
-            for pwr in POWERS:
-                f.write(f"  {pwr}: {set_orders[pwr]}\n")
-
-            # # 【其他国家用BP】
-            # # --- 给所有国家补齐 orders，保证能 process --- 
-            # set_orders: Dict[str, List[str]] = {p: [] for p in POWERS}
-
-            # # 我方：拿 top-k items 并写 log（默认 bqre_topK）
-            # my_orders, my_items, used_source, my_dropped = agent.choose_orders(
-            #     game=game,
-            #     power=args.power,
-            #     agent_state=states[args.power],
-            #     source=args.source,
-            #     top_k=args.topk,
-            #     mode=args.mode,
-            # )
-            # set_orders[args.power] = my_orders
-            # game.set_orders(args.power, my_orders)
-
-            # f.write("\n" + "=" * 90 + "\n")
-            # f.write(f"[STEP {step:04d}] phase={phase}\n")
-
-            # # ✅ 新增：每回合开始时打印所有玩家 units / SC / nonSC territory
-            # units = st.get("units", {}) or {}
-            # centers = st.get("centers", {}) or {}
-            # influence = st.get("influence", None)
-            # terr_src = "influence" if isinstance(influence, dict) else "fallback"
-
-            # f.write(f"[STATE BEFORE] terr_src={terr_src}\n")
-            # for pwr in POWERS:
-            #     ulist = list((units.get(pwr) or []))
-            #     sclist_raw = list((centers.get(pwr) or []))
-
-            #     sc_set, unit_set, past_free_set = get_territory_parts(st, pwr)
-            #     terr_set = sc_set | unit_set | past_free_set  # 这就是你定义的 Territory
-            #     sc_list = sorted(sc_set)
-            #     non_sc = sorted(terr_set - sc_set)
+#     try:
+#         import torch
+#         torch.manual_seed(args.seed)
+#         if torch.cuda.is_available():
+#             torch.cuda.manual_seed_all(args.seed)
+#         # 尽量 deterministic（可能牺牲一点速度）
+#         torch.backends.cudnn.deterministic = True
+#         torch.backends.cudnn.benchmark = False
+#     except Exception:
+#         pass
 
 
-            #     f.write(
-            #         f"  {pwr}: "
-            #         f"units({len(ulist)})={ulist} | "
-            #         f"SC({len(sc_list)})={sc_list} | "
-            #         f"nonSC({len(non_sc)})={non_sc}\n"
-            #     )
+#     # 1) 进入项目根目录（保证相对路径的模型/配置能找到）
+#     if args.project_root and os.path.exists(args.project_root):
+#         os.chdir(args.project_root)
 
-            # f.write(f"[ME] power={args.power} used_source={used_source} topk={len(my_items)}\n")
+#     # 2) log 路径
+#     ts = datetime.now().strftime("%y%m%d%H%M%S")
+#     log_dir = args.log_dir if os.path.isabs(args.log_dir) else os.path.join(os.getcwd(), args.log_dir)
+#     os.makedirs(log_dir, exist_ok=True)
+#     log_path = args.log if args.log else os.path.join(log_dir, f"consistent_{ts}.log")
 
-            # # ---- #
-            # # ✅ 过滤信息输出（后续你可以整段注释掉）
-            # f.write(f"[FILTERED OUT] n={len(my_dropped)}\n")
-            # for j, (a, pp, rsn) in enumerate(my_dropped):
-            #     if isinstance(a, (list, tuple)):
-            #         act_str = "[" + ", ".join(map(str, a)) + "]"
-            #     else:
-            #         act_str = str(a)
-            #     f.write(f"  -{j:02d}  p={float(pp):.8f}  reason={rsn}  action={act_str}\n")
-            # # ---- #
+#     # 3) 加载 agent + 初始化 game/state
+#     agent = load_cicero(args.cfg, skip_cache=False)
+#     game = pydipcc.Game()
+#     states = {p: agent.initialize_state(p) for p in POWERS}
 
-            # for i, (a, p) in enumerate(my_items):
-            #     # a 通常是 tuple/list[str]（一组 orders）
-            #     if isinstance(a, (list, tuple)):
-            #         act_str = "[" + ", ".join(map(str, a)) + "]"
-            #     else:
-            #         act_str = str(a)
-            #     f.write(f"  #{i:02d}  p={float(p):.8f}  action={act_str}\n")
+#     def _is_done(g: "pydipcc.Game") -> bool:
+#         # 尽量兼容不同 dipcc binding
+#         for attr in ("is_game_done", "is_game_over", "game_over"):
+#             if hasattr(g, attr):
+#                 try:
+#                     v = getattr(g, attr)
+#                     return bool(v() if callable(v) else v)
+#                 except Exception:
+#                     pass
+#         ph = str(g.get_current_phase()).upper()
+#         return ("COMPLETED" in ph) or (ph in {"DONE", "END"})
 
-            # # 其他国家：用 bp 的 top1（极简兜底）
-            # for pwr in POWERS:
-            #     if pwr == args.power:
-            #         continue
+#     with open(log_path, "w", encoding="utf-8") as f:
+#         f.write("=== CONSISTENT_AGENT RUN START ===\n")
+#         f.write(f"cwd={os.getcwd()}\n")
+#         f.write(f"cfg={args.cfg}\n")
+#         f.write(f"power={args.power}, seed={args.seed}, source={args.source}, mode={args.mode}, topk={args.topk}\n\n")
+#         f.flush()
 
-            #     bp_pol = agent.get_plausible_orders_policy(game=game, agent_power=pwr, agent_state=states[pwr])
-            #     dist = bp_pol.get(pwr, {}) or {}
-            #     if dist:
-            #         items = sorted(dist.items(), key=lambda kv: kv[1], reverse=True)
-            #         action = items[0][0]
-            #         orders = list(action) if isinstance(action, (list, tuple)) else [action]
-            #     else:
-            #         orders = []
+#         step = 0
+#         while step < args.max_phases and not _is_done(game):
+#             phase = game.get_current_phase()
 
-            #     set_orders[pwr] = orders
-            #     game.set_orders(pwr, orders)
+#              # ✅ 新增：每回合开始抓一次 state（用于 log: units / SC / territory）
+#             try:
+#                 st = game.get_state()
+#             except Exception:
+#                 st = {}
+#             if not isinstance(st, dict) and hasattr(st, "to_dict"):
+#                 try:
+#                     st = st.to_dict()
+#                 except Exception:
+#                     st = {}
+#             if not isinstance(st, dict):
+#                 st = {}
+#             # 【七个国家都是bqre_topK】
+#             # --- 给所有国家补齐 orders，保证能 process ---
+#             set_orders: Dict[str, List[str]] = {p: [] for p in POWERS}
 
-            # f.write("[ORDERS SET]\n")
-            # for pwr in POWERS:
-            #     f.write(f"  {pwr}: {set_orders[pwr]}\n")
+#             # 先让所有国家“在同一个 state 下”各自选单：只存，不写入 game（防止信息泄露）
+#             all_infos: Dict[str, Tuple[List[Tuple[Any, float]], str, List[Tuple[Any, float, str]]]] = {}
+#             tmp_orders: Dict[str, List[str]] = {}
+
+#             for pwr in POWERS:
+#                 orders, items, used_source, dropped = agent.choose_orders(
+#                     game=game,
+#                     power=pwr,
+#                     agent_state=states[pwr],
+#                     source=args.source,
+#                     top_k=args.topk,
+#                     mode=args.mode,
+#                 )
+#                 tmp_orders[pwr] = orders
+#                 all_infos[pwr] = (items, used_source, dropped)
+
+#             f.write("\n" + "=" * 90 + "\n")
+#             f.write(f"[STEP {step:04d}] phase={phase}\n")
+
+#             # ✅ 每回合开始时打印所有玩家 units / SC / nonSC territory（你原来的逻辑保留）
+#             units = st.get("units", {}) or {}
+#             centers = st.get("centers", {}) or {}
+#             influence = st.get("influence", None)
+#             terr_src = "influence" if isinstance(influence, dict) else "fallback"
+
+#             f.write(f"[STATE BEFORE] terr_src={terr_src}\n")
+#             for pwr in POWERS:
+#                 ulist = list((units.get(pwr) or []))
+#                 sc_set, unit_set, past_free_set = get_territory_parts(st, pwr)
+#                 terr_set = sc_set | unit_set | past_free_set
+#                 sc_list = sorted(sc_set)
+#                 non_sc = sorted(terr_set - sc_set)
+
+#                 f.write(
+#                     f"  {pwr}: "
+#                     f"units({len(ulist)})={ulist} | "
+#                     f"SC({len(sc_list)})={sc_list} | "
+#                     f"nonSC({len(non_sc)})={non_sc}\n"
+#                 )
+
+#             # ✅ 打印 7 国各自的 FILTERED OUT（以及可选的 topk 列表）
+#             for pwr in POWERS:
+#                 items, used_source, dropped = all_infos[pwr]
+#                 f.write(f"[AGENT] power={pwr} used_source={used_source} topk={len(items)}\n")
+
+#                 f.write(f"[FILTERED OUT] power={pwr} n={len(dropped)}\n")
+#                 for j, (a, pp, rsn) in enumerate(dropped):
+#                     if isinstance(a, (list, tuple)):
+#                         act_str = "[" + ", ".join(map(str, a)) + "]"
+#                     else:
+#                         act_str = str(a)
+#                     f.write(f"  -{j:02d}  p={float(pp):.8f}  reason={rsn}  action={act_str}\n")
+
+#                 # 如果你也想每个国家都打印 kept 的 topk（会很长），取消注释：
+#                 # for i, (a, p) in enumerate(items):
+#                 #     act_str = "[" + ", ".join(map(str, a)) + "]" if isinstance(a, (list, tuple)) else str(a)
+#                 #     f.write(f"  #{i:02d}  p={float(p):.8f}  action={act_str}\n")
+
+#             # ✅ 最后一次性写入 orders（避免后选国家“看见”先选国家 orders）
+#             for pwr in POWERS:
+#                 set_orders[pwr] = tmp_orders.get(pwr, [])
+#                 game.set_orders(pwr, set_orders[pwr])
+
+#             f.write("[ORDERS SET]\n")
+#             for pwr in POWERS:
+#                 f.write(f"  {pwr}: {set_orders[pwr]}\n")
+
+#             # # 【其他国家用BP】
+#             # # --- 给所有国家补齐 orders，保证能 process --- 
+#             # set_orders: Dict[str, List[str]] = {p: [] for p in POWERS}
+
+#             # # 我方：拿 top-k items 并写 log（默认 bqre_topK）
+#             # my_orders, my_items, used_source, my_dropped = agent.choose_orders(
+#             #     game=game,
+#             #     power=args.power,
+#             #     agent_state=states[args.power],
+#             #     source=args.source,
+#             #     top_k=args.topk,
+#             #     mode=args.mode,
+#             # )
+#             # set_orders[args.power] = my_orders
+#             # game.set_orders(args.power, my_orders)
+
+#             # f.write("\n" + "=" * 90 + "\n")
+#             # f.write(f"[STEP {step:04d}] phase={phase}\n")
+
+#             # # ✅ 新增：每回合开始时打印所有玩家 units / SC / nonSC territory
+#             # units = st.get("units", {}) or {}
+#             # centers = st.get("centers", {}) or {}
+#             # influence = st.get("influence", None)
+#             # terr_src = "influence" if isinstance(influence, dict) else "fallback"
+
+#             # f.write(f"[STATE BEFORE] terr_src={terr_src}\n")
+#             # for pwr in POWERS:
+#             #     ulist = list((units.get(pwr) or []))
+#             #     sclist_raw = list((centers.get(pwr) or []))
+
+#             #     sc_set, unit_set, past_free_set = get_territory_parts(st, pwr)
+#             #     terr_set = sc_set | unit_set | past_free_set  # 这就是你定义的 Territory
+#             #     sc_list = sorted(sc_set)
+#             #     non_sc = sorted(terr_set - sc_set)
 
 
-            #----#
+#             #     f.write(
+#             #         f"  {pwr}: "
+#             #         f"units({len(ulist)})={ulist} | "
+#             #         f"SC({len(sc_list)})={sc_list} | "
+#             #         f"nonSC({len(non_sc)})={non_sc}\n"
+#             #     )
 
-            # 推进一回合
-            try:
-                game.process()
-            except Exception as e:
-                f.write(f"[ERROR] game.process() failed @phase={phase}: {repr(e)}\n")
-                break
+#             # f.write(f"[ME] power={args.power} used_source={used_source} topk={len(my_items)}\n")
 
-            f.flush()
-            step += 1
+#             # # ---- #
+#             # # ✅ 过滤信息输出（后续你可以整段注释掉）
+#             # f.write(f"[FILTERED OUT] n={len(my_dropped)}\n")
+#             # for j, (a, pp, rsn) in enumerate(my_dropped):
+#             #     if isinstance(a, (list, tuple)):
+#             #         act_str = "[" + ", ".join(map(str, a)) + "]"
+#             #     else:
+#             #         act_str = str(a)
+#             #     f.write(f"  -{j:02d}  p={float(pp):.8f}  reason={rsn}  action={act_str}\n")
+#             # # ---- #
 
-        f.write("\n=== RUN END ===\n")
-        f.write(f"final_phase={game.get_current_phase()}\n")
-        f.flush()
+#             # for i, (a, p) in enumerate(my_items):
+#             #     # a 通常是 tuple/list[str]（一组 orders）
+#             #     if isinstance(a, (list, tuple)):
+#             #         act_str = "[" + ", ".join(map(str, a)) + "]"
+#             #     else:
+#             #         act_str = str(a)
+#             #     f.write(f"  #{i:02d}  p={float(p):.8f}  action={act_str}\n")
 
-    print(f"[OK] log saved to: {log_path}")
+#             # # 其他国家：用 bp 的 top1（极简兜底）
+#             # for pwr in POWERS:
+#             #     if pwr == args.power:
+#             #         continue
+
+#             #     bp_pol = agent.get_plausible_orders_policy(game=game, agent_power=pwr, agent_state=states[pwr])
+#             #     dist = bp_pol.get(pwr, {}) or {}
+#             #     if dist:
+#             #         items = sorted(dist.items(), key=lambda kv: kv[1], reverse=True)
+#             #         action = items[0][0]
+#             #         orders = list(action) if isinstance(action, (list, tuple)) else [action]
+#             #     else:
+#             #         orders = []
+
+#             #     set_orders[pwr] = orders
+#             #     game.set_orders(pwr, orders)
+
+#             # f.write("[ORDERS SET]\n")
+#             # for pwr in POWERS:
+#             #     f.write(f"  {pwr}: {set_orders[pwr]}\n")
 
 
-if __name__ == "__main__":
-    main()
+#             #----#
+
+#             # 推进一回合
+#             try:
+#                 game.process()
+#             except Exception as e:
+#                 f.write(f"[ERROR] game.process() failed @phase={phase}: {repr(e)}\n")
+#                 break
+
+#             f.flush()
+#             step += 1
+
+#         f.write("\n=== RUN END ===\n")
+#         f.write(f"final_phase={game.get_current_phase()}\n")
+#         f.flush()
+
+#     print(f"[OK] log saved to: {log_path}")
+
+
+# if __name__ == "__main__":
+#     main()

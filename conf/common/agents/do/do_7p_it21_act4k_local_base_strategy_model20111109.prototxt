@@ -1,11 +1,11 @@
-max_iters: 21
+max_iters: 11
 min_diff: 0.04
 min_diff_percentage: 10
-max_op_actions: 5
+max_op_actions: 3
 use_exact_op_policy: 0
 shuffle_powers: 1
 generation {
-    max_actions: 4000
+    max_actions: 2000
     local_uniform {
         num_base_actions: 5
         use_search_policy: 1

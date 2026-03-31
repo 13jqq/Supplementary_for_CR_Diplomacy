@@ -6,7 +6,10 @@ bqre1p {
       value_model_path: "models/diplodocus_high_rl_value_function.ckpt"
       rollout_model_path: "models/no_press_human_imitation_policy.ckpt"
 
-      max_seconds: 280
+      max_seconds: 40
+      
+
+      
       rollouts_cfg {
         max_rollout_length: 1
         year_spring_prob_of_ending: "1901,0;1909,0.2;1914,0.4"
@@ -14,12 +17,12 @@ bqre1p {
 
       order_aug {
         do {
-          max_seconds: 120
-          n_rollouts: 512
+          max_seconds: 8
+          n_rollouts: 64
         }
       }
 
-      n_rollouts: 2048
+      n_rollouts: 1024
     }
 
     do_bayesian_updates: false

@@ -1,7 +1,7 @@
 plausible_orders_cfg {
-  n_plausible_orders: 30
-  req_size: 1024
-  max_actions_units_ratio: 3.5
+  n_plausible_orders: 20
+  req_size: 512
+  max_actions_units_ratio: 3.0
 }
 rollouts_cfg {
   top_p: 0.95
