@@ -21,10 +21,10 @@ POWERS = [
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 ROOT_DIRS = {
-    "dipnet": PROJECT_ROOT / "logs_batch" / "log_dipnet_V1",
-    "searchbot": PROJECT_ROOT / "logs_batch" / "log_searchbot_V1",
-    "diplodocus_high": PROJECT_ROOT / "logs_batch" / "log_diplodocus_high_V1",
-    "cicero_nopress": PROJECT_ROOT / "logs_batch" / "log_cicero_nopress_V1",
+    "dipnet": PROJECT_ROOT / "logs_batch" / "log_dipnet_V2",
+    "searchbot": PROJECT_ROOT / "logs_batch" / "log_searchbot_V2",
+    "diplodocus_high": PROJECT_ROOT / "logs_batch" / "log_diplodocus_high_V2",
+    "cicero_nopress": PROJECT_ROOT / "logs_batch" / "log_cicero_nopress_V2",
 }
 
 def parse_args():
@@ -40,7 +40,7 @@ def parse_args():
     parser.add_argument("--source", default="bqre_topK")
     parser.add_argument("--mode", default="top1")
     parser.add_argument("--seed_start", type=int, default=0)
-    parser.add_argument("--seed_end", type=int, default=9)
+    parser.add_argument("--seed_end", type=int, default=39)
 
     return parser.parse_args()
 
