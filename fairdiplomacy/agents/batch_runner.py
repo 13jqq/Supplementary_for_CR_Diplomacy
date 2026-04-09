@@ -18,64 +18,97 @@ POWERS = [
     "TURKEY",
 ]
 
+AGENT_CHOICES = [
+    "consistent",
+    "cicero_nopress",
+    "diplodocus_high",
+    "diplodocus_low",
+    "searchbot",
+    "dipnet",
+]
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-ROOT_DIRS = {
-    "dipnet": PROJECT_ROOT / "logs_batch" / "log_dipnet_V2",
-    "searchbot": PROJECT_ROOT / "logs_batch" / "log_searchbot_V2",
-    "diplodocus_high": PROJECT_ROOT / "logs_batch" / "log_diplodocus_high_V2",
-    "cicero_nopress": PROJECT_ROOT / "logs_batch" / "log_cicero_nopress_V2",
+
+# 仅用于文件夹显示名；csv/log 里仍保留真实 agent 名称
+AGENT_FOLDER_ALIAS = {
+    "consistent": "consistent",
+    "cicero_nopress": "cicero",
+    "diplodocus_high": "diplodocus",
+    "diplodocus_low": "diplodocus_low",
+    "searchbot": "searchbot",
+    "dipnet": "dipnet",
 }
+
+
+def normalize_version_tag(version: str) -> str:
+    s = str(version).strip()
+    if not s:
+        return "V1"
+    if s[0] in ("v", "V"):
+        s = s[1:]
+    return f"V{s}"
+
+
+def version_lower(version: str) -> str:
+    return normalize_version_tag(version).lower()
+
+
+def power_dir_name(power: str) -> str:
+    return str(power).strip().title()
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--dipnet", action="store_true")
-    group.add_argument("--searchbot", action="store_true")
-    group.add_argument("--diplodocus_high", action="store_true")
-    group.add_argument("--cicero_nopress", action="store_true")
 
-    parser.add_argument("--setup", default="1v6")
-    parser.add_argument("--my_agent", default="consistent")
+    parser.add_argument("--setup", default="1v6", choices=["1v6", "all7"])
+    parser.add_argument("--my_agent", default="consistent", choices=AGENT_CHOICES)
+    parser.add_argument("--opp_agent", required=True, choices=AGENT_CHOICES)
+    parser.add_argument("--all_agent", default="consistent", choices=AGENT_CHOICES)
+
+    parser.add_argument("--version", default="V1")
     parser.add_argument("--source", default="bqre_topK")
-    parser.add_argument("--mode", default="top1")
+    parser.add_argument("--mode", default="bqre")
+    parser.add_argument("--topk", type=int, default=30)
+
     parser.add_argument("--seed_start", type=int, default=0)
-    parser.add_argument("--seed_end", type=int, default=39)
+    parser.add_argument("--seed_end", type=int, default=9)
 
     return parser.parse_args()
 
 
-def resolve_opp_agent(args):
-    if args.dipnet:
-        return "dipnet"
-    if args.searchbot:
-        return "searchbot"
-    if args.diplodocus_high:
-        return "diplodocus_high"
-    if args.cicero_nopress:
-        return "cicero_nopress"
-    raise ValueError("No opponent agent selected")
+def build_root_dir(args) -> Path:
+    version_tag = normalize_version_tag(args.version)
+    my_dir = f"{args.my_agent}_{args.setup}"
+
+    my_disp = AGENT_FOLDER_ALIAS.get(args.my_agent, args.my_agent)
+    opp_disp = AGENT_FOLDER_ALIAS.get(args.opp_agent, args.opp_agent)
+
+    return PROJECT_ROOT / "logs_batch" / my_dir / f"log_{my_disp}_vs_{opp_disp}_{version_tag}"
 
 
 def ensure_dirs(root_dir: Path):
     root_dir.mkdir(parents=True, exist_ok=True)
     for power in POWERS:
-        (root_dir / power).mkdir(parents=True, exist_ok=True)
+        (root_dir / power_dir_name(power)).mkdir(parents=True, exist_ok=True)
 
 
-def log_path_for(root_dir: Path, power: str, opp_agent: str, seed: int) -> Path:
-    return root_dir / power / f"run_1v6_my{power}_myconsistent_opp{opp_agent}_seed{seed}.log"
+def log_path_for(root_dir: Path, power: str, my_agent: str, opp_agent: str, seed: int, version: str) -> Path:
+    pdir = root_dir / power_dir_name(power)
+    vlow = version_lower(version)
+    return pdir / f"run_1v6_my{power}_my{my_agent}_opp{opp_agent}_seed{seed}_{vlow}.log"
 
 
-
-def try_claim_log(log_path: Path, power: str, seed: int, opp_agent: str) -> bool:
+def try_claim_log(log_path: Path, power: str, seed: int, my_agent: str, opp_agent: str, version: str) -> bool:
     payload = {
         "pid": os.getpid(),
         "host": socket.gethostname(),
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "power": power,
         "seed": seed,
+        "my_agent": my_agent,
         "opp_agent": opp_agent,
+        "version": normalize_version_tag(version),
         "log_path": str(log_path),
     }
 
@@ -84,26 +117,22 @@ def try_claim_log(log_path: Path, power: str, seed: int, opp_agent: str) -> bool
     except FileExistsError:
         return False
 
-    with os.fdopen(fd, "w") as f:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write("[CLAIMED BY BATCH_RUNNER]\n")
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
     return True
 
 
-
-
-def find_and_claim_next_task(root_dir: Path, opp_agent: str, seed_start: int, seed_end: int):
+def find_and_claim_next_task(root_dir: Path, my_agent: str, opp_agent: str, version: str, seed_start: int, seed_end: int):
     for power in POWERS:
         for seed in range(seed_start, seed_end + 1):
-            log_path = log_path_for(root_dir, power, opp_agent, seed)
+            log_path = log_path_for(root_dir, power, my_agent, opp_agent, seed, version)
 
-            # 已有 log：直接跳过
             if log_path.exists():
                 continue
 
-            # 尝试原子创建 log 作为占位
-            ok = try_claim_log(log_path, power, seed, opp_agent)
+            ok = try_claim_log(log_path, power, seed, my_agent, opp_agent, version)
             if ok:
                 return {
                     "power": power,
@@ -113,36 +142,32 @@ def find_and_claim_next_task(root_dir: Path, opp_agent: str, seed_start: int, se
 
     return None
 
-def run_one_task(task, args, opp_agent: str, root_dir: Path) -> int:
+
+def run_one_task(task, args, root_dir: Path) -> int:
     power = task["power"]
     seed = task["seed"]
     log_path = task["log_path"]
+    power_dir = root_dir / power_dir_name(power)
 
     cmd = [
         sys.executable,
         "-m",
         "consistent_runner_for",
-        "--setup",
-        args.setup,
-        "--power",
-        power,
-        "--seed",
-        str(seed),
-        "--my_agent",
-        args.my_agent,
-        "--opp_agent",
-        opp_agent,
-        "--source",
-        args.source,
-        "--mode",
-        args.mode,
-        "--log_dir",
-        str(root_dir / power),
-        "--log",
-        str(log_path),
+        "--setup", args.setup,
+        "--power", power,
+        "--seed", str(seed),
+        "--my_agent", args.my_agent,
+        "--opp_agent", args.opp_agent,
+        "--all_agent", args.all_agent,
+        "--source", args.source,
+        "--mode", args.mode,
+        "--topk", str(args.topk),
+        "--exp_version", normalize_version_tag(args.version),
+        "--log_dir", str(power_dir),
+        "--log", str(log_path),
     ]
 
-    print(f"[RUN] power={power} seed={seed} opp={opp_agent}")
+    print(f"[RUN] power={power} seed={seed} my={args.my_agent} opp={args.opp_agent}")
     print(" ".join(cmd))
     result = subprocess.run(cmd)
     return result.returncode
@@ -150,21 +175,22 @@ def run_one_task(task, args, opp_agent: str, root_dir: Path) -> int:
 
 def main():
     args = parse_args()
-    opp_agent = resolve_opp_agent(args)
-    root_dir = ROOT_DIRS[opp_agent]
+    root_dir = build_root_dir(args)
 
     ensure_dirs(root_dir)
 
     while True:
         task = find_and_claim_next_task(
             root_dir=root_dir,
-            opp_agent=opp_agent,
+            my_agent=args.my_agent,
+            opp_agent=args.opp_agent,
+            version=args.version,
             seed_start=args.seed_start,
             seed_end=args.seed_end,
         )
 
         if task is None:
-            print(f"[DONE] no remaining tasks for opp_agent={opp_agent}")
+            print(f"[DONE] no remaining tasks for my_agent={args.my_agent}, opp_agent={args.opp_agent}")
             break
 
         power = task["power"]
@@ -172,9 +198,9 @@ def main():
         log_path = task["log_path"]
 
         try:
-            rc = run_one_task(task, args, opp_agent, root_dir)
+            rc = run_one_task(task, args, root_dir)
             if rc != 0:
-                with open(log_path, "a") as f:
+                with open(log_path, "a", encoding="utf-8") as f:
                     f.write(f"\n[BATCH_RUNNER_ERROR] returncode={rc}\n")
                 print(f"[FAILED] power={power} seed={seed} returncode={rc}")
                 sys.exit(rc)
@@ -185,7 +211,7 @@ def main():
             print(f"[STOPPED] power={power} seed={seed}")
             raise
         except Exception as e:
-            with open(log_path, "a") as f:
+            with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"\n[BATCH_RUNNER_EXCEPTION] {repr(e)}\n")
             print(f"[EXCEPTION] power={power} seed={seed} err={e}")
             raise

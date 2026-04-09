@@ -406,6 +406,16 @@ def _fmt_post_check_violations(violations):
             parts.append(tag)
 
     return ", ".join(parts)
+def normalize_version_tag(version: str) -> str:
+    s = str(version).strip()
+    if not s:
+        return "V1"
+    if s[0] in ("v", "V"):
+        s = s[1:]
+    return f"V{s}"
+
+def power_dir_name(power: str) -> str:
+    return str(power).strip().title()
 #  ----------------------------
 # Main
 # ----------------------------
@@ -446,6 +456,7 @@ def main():
     parser.add_argument("--max_phases", type=int, default=60)
     parser.add_argument("--log_dir", type=str, default="logs_consistent")
     parser.add_argument("--log", type=str, default=None)
+    parser.add_argument("--exp_version", type=str, default="V1")
 
     args = parser.parse_args()
     seed_everything(args.seed)
@@ -458,9 +469,12 @@ def main():
     ts = datetime.now().strftime("%y%m%d%H%M%S")
     log_dir = args.log_dir if os.path.isabs(args.log_dir) else os.path.join(os.getcwd(), args.log_dir)
     os.makedirs(log_dir, exist_ok=True)
+    version_tag = normalize_version_tag(args.exp_version)
+    version_low = version_tag.lower()
+
     default_name = (
         f"run_{args.setup}_my{args.power}_my{args.my_agent}_"
-        f"opp{args.opp_agent}_all{args.all_agent}_seed{args.seed}.log"
+        f"opp{args.opp_agent}_seed{args.seed}_{version_low}.log"
     )
     log_path = args.log if args.log else os.path.join(log_dir, default_name)
 
