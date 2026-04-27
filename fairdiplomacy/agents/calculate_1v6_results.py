@@ -2,30 +2,24 @@
 # -*- coding: utf-8 -*-
 
 """
-统计 1v6 Diplomacy 实验结果（同时统计我方 consistent 与对手 agent）。
+统计单个 1v6 / all7 Diplomacy 实验目录下的结果。
 
-目录结构约定：
+适配当前 batch runner 的目录规则：
 logs_batch/
-  log_dipnet_V1/
-    AUSTRIA/
-      results_setup=1v6_my=consistent_opp=dipnet_v2.csv
-    ENGLAND/
+  <my_agent>_<setup>/
+    log_<my_alias>_vs_<opp_alias>_<Vx>/
+      Austria/
+        results_setup=1v6_my=cicero_nopress_opp=diplodocus_high_v1.csv
+      England/
       ...
-  log_searchbot_V1/
-    ...
 
-脚本会：
-1. 扫描 base_dir 下所有对手目录（默认扫描名称以 log_ 开头的目录）
-2. 读取其下七个国家文件夹中的结果 CSV
-3. 同时统计两类对象：
-   - consistent：每局中由我方控制的那个国家（每局 1 个样本）
-   - opponent：每局中由对手控制的其余六个国家（每局 6 个样本）
-4. 计算以下指标：
-   - mean SoS
-   - Win / Most SC / Survived / Defeated（四者互斥）
-   - C1~C4 触发次数（总次数与平均每个国家样本次数）
-   - 支持成功率（sum(success) / sum(total)）
-5. 在每个对手目录下输出：
+功能：
+1. 根据 --my_agent / --opp_agent / --setup / --version 精确定位一个实验目录
+2. 在每个国家目录中寻找对应结果 CSV（优先匹配与 version 一致的文件名）
+3. 同时统计：
+   - self: 该局由我方控制的那个国家（每局 1 个 country-sample）
+   - opponent: 该局由对手控制的其余国家（1v6 下每局 6 个 country-sample）
+4. 输出：
    - summary_metrics_both_agents.csv
    - summary_metrics_both_agents.json
 """
@@ -35,7 +29,7 @@ import csv
 import json
 from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 POWERS = [
@@ -48,23 +42,89 @@ POWERS = [
     "TURKEY",
 ]
 
+AGENT_CHOICES = [
+    "consistent",
+    "consistent_docus",
+    "cicero_nopress",
+    "diplodocus_high",
+    "diplodocus_low",
+    "searchbot",
+    "dipnet",
+    "searchbot_neurips21_dora",
+]
+
+AGENT_FOLDER_ALIAS = {
+    "consistent": "consistent",
+    "consistent_docus": "consistent_docus",
+    "cicero_nopress": "cicero",
+    "diplodocus_high": "diplodocus",
+    "diplodocus_low": "diplodocus_low",
+    "searchbot": "searchbot",
+    "dipnet": "dipnet",
+    "searchbot_neurips21_dora": "dora",
+}
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def normalize_version_tag(version: str) -> str:
+    s = str(version).strip()
+    if not s:
+        return "V1"
+    if s[0] in ("v", "V"):
+        s = s[1:]
+    return f"V{s}"
+
+
+def version_lower(version: str) -> str:
+    return normalize_version_tag(version).lower()
+
+
+def power_dir_name(power: str) -> str:
+    return str(power).strip().title()
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--base_dir", type=str, default="logs_batch")
+    parser.add_argument("--setup", default="1v6", choices=["1v6", "all7"])
+    parser.add_argument("--my_agent", default="consistent", choices=AGENT_CHOICES)
+    parser.add_argument("--opp_agent", required=True, choices=AGENT_CHOICES)
+    parser.add_argument("--version", default="V1")
+    parser.add_argument("--seed_start", type=int, default=None)
+    parser.add_argument("--seed_end", type=int, default=None)
     parser.add_argument(
-        "--base_dir",
+        "--experiment_dir",
         type=str,
-        default="logs_batch",
-        help="包含各对手实验文件夹的大目录，例如 logs_batch",
-    )
-    parser.add_argument(
-        "--pattern",
-        type=str,
-        default="log_*",
-        help="对手目录匹配模式，默认扫描 log_*",
+        default=None,
+        help="Optional absolute/relative path to a specific experiment dir. If given, it overrides base_dir+my_agent+opp_agent+version resolution.",
     )
     return parser.parse_args()
 
+def _seed_in_range(row: Dict, args) -> bool:
+    raw = row.get("seed", "")
+    try:
+        seed = int(str(raw).strip())
+    except Exception:
+        return False
+
+    if args.seed_start is not None and seed < args.seed_start:
+        return False
+    if args.seed_end is not None and seed > args.seed_end:
+        return False
+    return True
+
+def build_root_dir(args) -> Path:
+    if args.experiment_dir:
+        p = Path(args.experiment_dir)
+        return p if p.is_absolute() else (PROJECT_ROOT / p)
+
+    version_tag = normalize_version_tag(args.version)
+    my_dir = f"{args.my_agent}_{args.setup}"
+    my_disp = AGENT_FOLDER_ALIAS.get(args.my_agent, args.my_agent)
+    opp_disp = AGENT_FOLDER_ALIAS.get(args.opp_agent, args.opp_agent)
+    base_dir = resolve_base_dir(args.base_dir)
+    return base_dir / my_dir / f"log_{my_disp}_vs_{opp_disp}_{version_tag}"
 
 def _to_int(x) -> int:
     if x is None or x == "":
@@ -78,27 +138,50 @@ def _to_float(x) -> float:
     return float(x)
 
 
-def _find_country_csvs(opp_dir: Path) -> Dict[str, Path]:
+def _pick_best_csv(candidates: List[Path], preferred_suffix: str) -> Optional[Path]:
+    if not candidates:
+        return None
+
+    # 先优先挑选文件名后缀版本匹配的；同类中选最新修改时间
+    matched = [p for p in candidates if p.name.endswith(preferred_suffix)]
+    if matched:
+        return max(matched, key=lambda p: p.stat().st_mtime)
+
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _find_country_csvs(root_dir: Path, args) -> Dict[str, Path]:
     out = {}
+    preferred_suffix = f"_{version_lower(args.version)}.csv"
+
     for power in POWERS:
-        power_dir = opp_dir / power
+        power_dir = root_dir / power_dir_name(power)
         if not power_dir.is_dir():
             continue
 
-        candidates = sorted(power_dir.glob("results_setup=1v6_my=consistent_opp=*_v2.csv"))
-        if not candidates:
-            candidates = sorted(power_dir.glob("results_setup=1v6_my=consistent_opp=*.csv"))
+        patterns = [
+            f"results_setup={args.setup}_my={args.my_agent}_opp={args.opp_agent}_{version_lower(args.version)}.csv",
+            f"results_setup={args.setup}_my={args.my_agent}_opp={args.opp_agent}_*.csv",
+            f"results_setup={args.setup}_my={args.my_agent}_opp=*.csv",
+            "results_setup=*.csv",
+        ]
 
-        if candidates:
-            out[power] = candidates[0]
+        candidates: List[Path] = []
+        for pat in patterns:
+            found = list(power_dir.glob(pat))
+            if found:
+                candidates = found
+                break
+
+        best = _pick_best_csv(candidates, preferred_suffix)
+        if best is not None:
+            out[power] = best
+
     return out
 
 
 def _read_csv_dedup_by_game_id(csv_path: Path) -> List[Dict]:
-    """
-    读取单个 CSV。
-    若同一个 game_id 出现多次，保留最后一行（适合覆盖式重跑后的统计）。
-    """
+    """若同一个 game_id 出现多次，保留最后一行。"""
     rows_by_game_id = OrderedDict()
     with open(csv_path, "r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
@@ -111,16 +194,6 @@ def _read_csv_dedup_by_game_id(csv_path: Path) -> List[Dict]:
 
 
 def _classify_outcome_for_power(row: Dict, power: str) -> str:
-    """
-    四类结局划分（互斥）：
-    1) 若有人 >= 18 SC：
-       - 该国 -> Win
-       - 其他六国 -> Defeated
-    2) 否则（draw）：
-       - 最高 SC 的国家 -> Most SC（并列最高也都算）
-       - 0 SC -> Defeated
-       - 其他且 SC > 0 -> Survived
-    """
     sc_map = {p: _to_int(row.get(f"sc_{p}", 0)) for p in POWERS}
     my_sc = sc_map[power]
     max_sc = max(sc_map.values())
@@ -137,7 +210,7 @@ def _classify_outcome_for_power(row: Dict, power: str) -> str:
 
 def _init_stats() -> Dict:
     return {
-        "n_samples": 0,  # 这里的样本单位是“一个国家在一局中的结果”
+        "n_samples": 0,
         "sos_sum": 0.0,
         "win_count": 0,
         "most_sc_count": 0,
@@ -233,16 +306,15 @@ def _finalize_stats(stats: Dict) -> Dict:
     }
 
 
-def summarize_one_opponent(opp_dir: Path) -> Tuple[List[Dict], Dict]:
-    country_csvs = _find_country_csvs(opp_dir)
+def summarize_one_experiment(root_dir: Path, args) -> Tuple[List[Dict], Dict]:
+    country_csvs = _find_country_csvs(root_dir, args)
 
-    # role=consistent/opponent, 再分别存 per_power 与 overall
     per_power_stats = {
-        "consistent": {p: _init_stats() for p in POWERS},
+        "self": {p: _init_stats() for p in POWERS},
         "opponent": {p: _init_stats() for p in POWERS},
     }
     overall_stats = {
-        "consistent": _init_stats(),
+        "self": _init_stats(),
         "opponent": _init_stats(),
     }
 
@@ -253,15 +325,16 @@ def summarize_one_opponent(opp_dir: Path) -> Tuple[List[Dict], Dict]:
         source_files[my_power] = str(csv_path)
 
         for row in rows:
-            row_power = row.get("my_power", "")
+            if not _seed_in_range(row, args):
+                continue
+
+            row_power = str(row.get("my_power", "")).strip().upper()
             if row_power != my_power:
                 continue
 
-            # 1) consistent：该局只有 my_power 这一个国家属于我方
-            _update_stats(per_power_stats["consistent"][my_power], row, my_power)
-            _update_stats(overall_stats["consistent"], row, my_power)
+            _update_stats(per_power_stats["self"][my_power], row, my_power)
+            _update_stats(overall_stats["self"], row, my_power)
 
-            # 2) opponent：其余六个国家都属于该对手
             for opp_power in POWERS:
                 if opp_power == my_power:
                     continue
@@ -270,49 +343,87 @@ def summarize_one_opponent(opp_dir: Path) -> Tuple[List[Dict], Dict]:
 
     summary_rows = []
 
-    # 每个角色、每个国家一行
-    for role in ["consistent", "opponent"]:
+    for side, agent_name in [("self", args.my_agent), ("opponent", args.opp_agent)]:
         for power in POWERS:
-            finalized = _finalize_stats(per_power_stats[role][power])
+            finalized = _finalize_stats(per_power_stats[side][power])
             summary_rows.append({
-                "role": role,
+                "side": side,
+                "agent_name": agent_name,
                 "scope": "per_power",
                 "power": power,
                 **finalized,
             })
 
-    # 每个角色 overall 一行
-    for role in ["consistent", "opponent"]:
-        finalized = _finalize_stats(overall_stats[role])
+    for side, agent_name in [("self", args.my_agent), ("opponent", args.opp_agent)]:
+        finalized = _finalize_stats(overall_stats[side])
         summary_rows.append({
-            "role": role,
+            "side": side,
+            "agent_name": agent_name,
             "scope": "overall",
             "power": "OVERALL",
             **finalized,
         })
 
     meta = {
-        "opponent_folder": str(opp_dir),
+        "experiment_dir": str(root_dir),
+        "setup": args.setup,
+        "my_agent": args.my_agent,
+        "opp_agent": args.opp_agent,
+        "seed_start": args.seed_start,
+        "seed_end": args.seed_end,
+        "version": normalize_version_tag(args.version),
         "country_csvs": source_files,
         "summary_note": (
             "Win/Most SC/Survived/Defeated are mutually exclusive. "
             "If any power has >=18 SC, that power is Win and all others are Defeated. "
             "Otherwise, powers tied for the highest SC are Most SC, powers with 0 SC are Defeated, "
             "and the remaining powers are Survived. "
-            "For role=consistent, each game contributes 1 country-sample; "
-            "for role=opponent, each game contributes 6 country-samples."
+            "For side=self, each game contributes 1 country-sample; "
+            "for side=opponent, each game contributes remaining country-samples."
         ),
     }
 
     return summary_rows, meta
 
+def build_seed_tag(args) -> str:
+    if args.seed_start is None and args.seed_end is None:
+        return "allseeds"
 
-def write_summary_files(opp_dir: Path, summary_rows: List[Dict], meta: Dict):
-    csv_path = opp_dir / "summary_metrics_both_agents.csv"
-    json_path = opp_dir / "summary_metrics_both_agents.json"
+    start = "min" if args.seed_start is None else str(args.seed_start)
+    end = "max" if args.seed_end is None else str(args.seed_end)
+    return f"seed{start}-{end}"
+
+def format_summary_row(row: Dict, ndigits: int = 6) -> Dict:
+    float_fields = {
+        "mean_sos",
+        "win_rate",
+        "most_sc_rate",
+        "survived_rate",
+        "defeated_rate",
+        "c1_avg_per_sample",
+        "c2_avg_per_sample",
+        "c3_avg_per_sample",
+        "c4_avg_per_sample",
+        "support_success_ratio",
+    }
+
+    out = {}
+    for k, v in row.items():
+        if k in float_fields:
+            out[k] = f"{float(v):.{ndigits}f}"
+        else:
+            out[k] = v
+    return out
+
+def write_summary_files(root_dir: Path, summary_rows: List[Dict], meta: Dict, args):
+    seed_tag = build_seed_tag(args)
+    prefix = f"summary_{args.my_agent}_vs_{args.opp_agent}_{args.setup}_{normalize_version_tag(args.version)}_{seed_tag}"
+    csv_path = root_dir / f"{prefix}.csv"
+    json_path = root_dir / f"{prefix}.json"
 
     fieldnames = [
-        "role",
+        "side",
+        "agent_name",
         "scope",
         "power",
         "n_samples",
@@ -342,13 +453,13 @@ def write_summary_files(opp_dir: Path, summary_rows: List[Dict], meta: Dict):
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for row in summary_rows:
-            writer.writerow(row)
+            writer.writerow(format_summary_row(row, 6))
 
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(
             {
                 "meta": meta,
-                "summary_rows": summary_rows,
+                "summary_rows": [format_summary_row(row, 6) for row in summary_rows],
             },
             f,
             ensure_ascii=False,
@@ -358,23 +469,20 @@ def write_summary_files(opp_dir: Path, summary_rows: List[Dict], meta: Dict):
     print(f"[OK] saved: {csv_path}")
     print(f"[OK] saved: {json_path}")
 
+def resolve_base_dir(base_dir: str) -> Path:
+    p = Path(base_dir)
+    if p.is_absolute():
+        return p
+    return PROJECT_ROOT / p
 
 def main():
     args = parse_args()
-    base_dir = Path(args.base_dir)
+    root_dir = build_root_dir(args)
 
-    if not base_dir.exists():
-        raise FileNotFoundError(f"base_dir not found: {base_dir}")
-
-    opp_dirs = sorted([p for p in base_dir.glob(args.pattern) if p.is_dir()])
-
-    if not opp_dirs:
-        print(f"[WARN] no opponent folders found under {base_dir} with pattern={args.pattern}")
-        return
-
-    for opp_dir in opp_dirs:
-        summary_rows, meta = summarize_one_opponent(opp_dir)
-        write_summary_files(opp_dir, summary_rows, meta)
+    if not root_dir.exists():
+        raise FileNotFoundError(f"experiment dir not found: {root_dir}")
+    summary_rows, meta = summarize_one_experiment(root_dir, args)
+    write_summary_files(root_dir, summary_rows, meta, args)
 
 
 if __name__ == "__main__":

@@ -7,10 +7,13 @@ from typing import Any, Dict, List, Tuple
 import heyhi
 import os
 import csv
-try:
-    from .consistent_agent import POWERS, get_territory_parts, ConsistentAgent
-except Exception:
-    from fairdiplomacy.agents.consistent_agent import POWERS, get_territory_parts, ConsistentAgent
+from fairdiplomacy.agents.consistent_agent_V2 import (
+    POWERS,
+    get_territory_parts,
+    ConsistentAgent,
+    load_consistent_agent,
+    load_consistent_docus_agent,
+)
 import heyhi
 from fairdiplomacy.agents.bqre1p_agent import BQRE1PAgent
 from fairdiplomacy.agents.searchbot_agent import SearchBotAgent
@@ -96,17 +99,17 @@ def _disable_cfr_messages_best_effort(agent_cfg: Any) -> Any:
     except Exception:
         return agent_cfg
 
-def load_consistent_agent(cfg_path: str, *, skip_cache: bool = False) -> ConsistentAgent:
-    full_cfg = heyhi.load_config(cfg_path)
+# def load_consistent_agent(cfg_path: str, *, skip_cache: bool = False) -> ConsistentAgent:
+#     full_cfg = heyhi.load_config(cfg_path)
 
-    if hasattr(full_cfg, "agent") and hasattr(full_cfg.agent, "consistent_agent"):
-        agent_cfg = full_cfg.agent.consistent_agent
-    elif hasattr(full_cfg, "consistent_agent"):
-        agent_cfg = full_cfg.consistent_agent
-    else:
-        raise ValueError(f"Bad config structure in {cfg_path}: cannot find consistent_agent")
+#     if hasattr(full_cfg, "agent") and hasattr(full_cfg.agent, "consistent_agent"):
+#         agent_cfg = full_cfg.agent.consistent_agent
+#     elif hasattr(full_cfg, "consistent_agent"):
+#         agent_cfg = full_cfg.consistent_agent
+#     else:
+#         raise ValueError(f"Bad config structure in {cfg_path}: cannot find consistent_agent")
 
-    return ConsistentAgent(agent_cfg, skip_base_strategy_model_cache=skip_cache)
+#     return ConsistentAgent(agent_cfg, skip_base_strategy_model_cache=skip_cache)
 
 def load_cicero_nopress_agent(cfg_path: str, *, skip_cache: bool = False) -> BQRE1PAgent:
     """
@@ -199,7 +202,15 @@ def load_dipnet_agent(cfg_path: str) -> BaseStrategyModelAgent:
 # Agent assignment
 # ----------------------------
 AgentKind = str
-AGENT_KINDS: List[AgentKind] = ["consistent", "cicero_nopress", "diplodocus_high","diplodocus_low", "searchbot", "dipnet"]
+AGENT_KINDS: List[AgentKind] = [
+    "consistent",
+    "consistent_docus",
+    "cicero_nopress",
+    "diplodocus_high",
+    "diplodocus_low",
+    "searchbot",
+    "dipnet",
+]
 
 
 def pick_agent_for_power(
@@ -241,6 +252,7 @@ def choose_orders_wrapper(
     str,
     List[Tuple[Any, float, str]],
     List[Tuple[Any, float]],
+    List[Dict[str, Any]],
 ]:
     if hasattr(agent, "get_orders_info"):
         info = agent.get_orders_info(
@@ -252,10 +264,11 @@ def choose_orders_wrapper(
             mode=mode,
         )
         raw_items = info.get("raw_items", []) or []
-        return info["orders"], info["items"], info["used_source"], info["dropped"], raw_items
+        repair_logs = info.get("repair_logs", []) or []
+        return info["orders"], info["items"], info["used_source"], info["dropped"], raw_items, repair_logs
 
     orders = agent.get_orders(game, power=power, state=state)
-    return orders, [], type(agent).__name__, [], []
+    return orders, [], type(agent).__name__, [], [], []
 
 def _fmt_action(action: Any) -> str:
     """把候选动作转成便于日志查看的字符串"""
@@ -413,7 +426,8 @@ def normalize_version_tag(version: str) -> str:
     if s[0] in ("v", "V"):
         s = s[1:]
     return f"V{s}"
-
+def fmt_float(x, ndigits=6):
+    return f"{float(x):.{ndigits}f}"
 def power_dir_name(power: str) -> str:
     return str(power).strip().title()
 #  ----------------------------
@@ -428,7 +442,9 @@ def main():
     parser = argparse.ArgumentParser()
 
     # ✅ consistent agent config（你自己的）
+    # parser.add_argument("--cfg_consistent", type=str, default="conf/common/agents/consistent_agent.prototxt")
     parser.add_argument("--cfg_consistent", type=str, default="conf/common/agents/consistent_agent.prototxt")
+    parser.add_argument("--cfg_consistent_docus", type=str, default="conf/common/agents/consistent_docus.prototxt")
 
     # ✅ 4 个对手 config（按你给的“正确写法”命名）
     parser.add_argument("--cfg_cicero_nopress", type=str, default="conf/common/agents/cicero_nopress.prototxt")
@@ -436,6 +452,7 @@ def main():
     parser.add_argument("--cfg_diplodocus_low", type=str, default="conf/common/agents/diplodocus_low.prototxt")
     parser.add_argument("--cfg_searchbot", type=str, default="conf/common/agents/searchbot.prototxt")
     parser.add_argument("--cfg_dipnet", type=str, default="conf/common/agents/base_strategy_model.prototxt")
+    parser.add_argument(    "--cfg_searchbot_neurips21_dora",    type=str,    default="conf/common/agents/searchbot_neurips21_dora.prototxt",)
 
     parser.add_argument("--project_root", type=str, default="/workspace/Diplomacy/diplomacy_cicero")
     parser.add_argument("--power", type=str, default="AUSTRIA", choices=POWERS)
@@ -444,7 +461,16 @@ def main():
 
     # ✅ 策略选择：包含我们自己 + 4 个对手
     # 默认先测 DipNet：opp_agent=dipnet
-    AGENT_TYPES = ["consistent", "cicero_nopress", "diplodocus_high","diplodocus_low", "searchbot", "dipnet"]
+    AGENT_TYPES = [
+        "consistent",
+        "consistent_docus",
+        "cicero_nopress",
+        "diplodocus_high",
+        "diplodocus_low",
+        "searchbot",
+        "dipnet",
+        "searchbot_neurips21_dora",
+    ]
     parser.add_argument("--my_agent", type=str, default="consistent", choices=AGENT_TYPES)
     parser.add_argument("--opp_agent", type=str, default="dipnet", choices=AGENT_TYPES)
     parser.add_argument("--all_agent", type=str, default="consistent", choices=AGENT_TYPES)
@@ -485,7 +511,8 @@ def main():
     else:
         needed.add(args.my_agent)
         needed.add(args.opp_agent)
-    needed.add("consistent")
+    # needed.add("consistent")
+    
 
     # BOOT log early
     with open(log_path, "w", encoding="utf-8") as f:
@@ -501,6 +528,9 @@ def main():
         if t == "consistent":
             return load_consistent_agent(args.cfg_consistent, skip_cache=False)
 
+        if t == "consistent_docus":
+            return load_consistent_docus_agent(args.cfg_consistent_docus, skip_cache=False)
+
         if t == "cicero_nopress":
             return load_cicero_nopress_agent(args.cfg_cicero_nopress, skip_cache=False)
 
@@ -513,6 +543,8 @@ def main():
 
         if t == "searchbot":
             return load_searchbot_agent(args.cfg_searchbot, skip_cache=False)
+        if t == "searchbot_neurips21_dora":
+            return load_searchbot_agent(args.cfg_searchbot_neurips21_dora, skip_cache=False)
 
         if t == "dipnet":
             return load_dipnet_agent(args.cfg_dipnet)
@@ -548,11 +580,13 @@ def main():
         f.write(f"cwd={os.getcwd()}\n")
         f.write(f"setup={args.setup} my_power={args.power}\n")
         f.write(f"cfg_consistent={args.cfg_consistent}\n")
+        f.write(f"cfg_consistent_docus={args.cfg_consistent_docus}\n")
         f.write(f"cfg_cicero_nopress={args.cfg_cicero_nopress}\n")
         f.write(f"cfg_diplodocus_high={args.cfg_diplodocus_high}\n")
         f.write(f"cfg_diplodocus_low={args.cfg_diplodocus_low}\n")
         f.write(f"cfg_searchbot={args.cfg_searchbot}\n")
         f.write(f"cfg_dipnet={args.cfg_dipnet}\n")
+        f.write(f"cfg_searchbot_neurips21_dora={args.cfg_searchbot_neurips21_dora}\n")
         f.write(f"my_agent={args.my_agent} opp_agent={args.opp_agent} all_agent={args.all_agent}\n")
         f.write(f"seed={args.seed} source={args.source} mode={args.mode} topk={args.topk} max_phases={args.max_phases}\n")
 
@@ -571,8 +605,11 @@ def main():
         # ✅ 同一组实验写到同一张表
         csv_path = os.path.join(
             log_dir,
-            f"results_setup={args.setup}_my={args.my_agent}_opp={args.opp_agent}_v2.csv",
+            f"results_setup={args.setup}_my={args.my_agent}_opp={args.opp_agent}_{version_low}.csv",
         )
+        print(f"[LOG_DIR] {log_dir}")
+        print(f"[LOG_PATH] {log_path}")
+        print(f"[CSV_PATH] {csv_path}")
         game_id = os.path.splitext(os.path.basename(log_path))[0]
 
         step = 0
@@ -602,7 +639,7 @@ def main():
 
             # pick orders (store first, set later)
             tmp_orders: Dict[str, List[str]] = {}
-            all_infos: Dict[str, Tuple[List[Tuple[Any, float]], str, List[Tuple[Any, float, str]], List[Tuple[Any, float]]]] = {}
+            all_infos: Dict[str, Tuple[List[Tuple[Any, float]], str, List[Tuple[Any, float, str]], List[Tuple[Any, float]], List[Dict[str, Any]]]] = {}
 
             per_power_time: Dict[str, float] = {}
 
@@ -614,13 +651,13 @@ def main():
                 # 当前国家没有 unit：直接跳过，不调用 agent
                 if len(units.get(pwr) or []) == 0:
                     tmp_orders[pwr] = []
-                    all_infos[pwr] = ([], "skip_no_units", [], [])
+                    all_infos[pwr] = ([], "skip_no_units", [], [], [])
                     per_power_time[pwr] = 0.0
                     continue
 
                 ag = agent_for_power[pwr]
                 pwr_t0 = time.perf_counter()
-                orders, items, used_source, dropped, raw_items = choose_orders_wrapper(
+                orders, items, used_source, dropped, raw_items, repair_logs = choose_orders_wrapper(
                     ag,
                     game=game,
                     power=pwr,
@@ -632,7 +669,7 @@ def main():
                 pwr_elapsed = time.perf_counter() - pwr_t0
 
                 tmp_orders[pwr] = orders
-                all_infos[pwr] = (items, used_source, dropped, raw_items)
+                all_infos[pwr] = (items, used_source, dropped, raw_items, repair_logs)
                 per_power_time[pwr] = pwr_elapsed
             choose_all_elapsed = time.perf_counter() - choose_all_t0
 
@@ -660,7 +697,7 @@ def main():
 
             # per-power info
             for pwr in POWERS:
-                items, used_source, dropped, raw_items = all_infos[pwr]
+                items, used_source, dropped, raw_items , repair_logs = all_infos[pwr]
                 tagp = _tag(pwr)
 
                 f.write(
@@ -669,10 +706,21 @@ def main():
                     f"choose_time={per_power_time[pwr]:.4f}s\n"
                 )
 
-                if tagp == "consistent":
+                if repair_logs:
+                    f.write(f"[C3] power={pwr} n={len(repair_logs)}\n")
+                    for j, ev in enumerate(repair_logs):
+                        f.write(
+                            f"  {ev['tag']}-{j:02d} "
+                            f"dest='{ev.get('dest', '')}' "
+                            f"replaced='{ev.get('replaced', '')}' "
+                            f"modified_to='{ev.get('modified_to', '')}'\n"
+                        )
+                        f.write(f"    before={list(ev.get('before_action', []))}\n")
+                        f.write(f"    after ={list(ev.get('after_action', []))}\n")
+
+                if tagp in ("consistent", "consistent_docus"):
                     f.write(f"[FINAL CHOICE] power={pwr} orders={tmp_orders.get(pwr, [])}\n")
 
-                    # 无单位时前面已经直接跳过选单了，这里不要再做异常检查
                     if used_source != "skip_no_units":
                         _check_consistent_candidate_bug_or_raise(
                             f=f,
@@ -684,6 +732,49 @@ def main():
                             orders=tmp_orders.get(pwr, []),
                         )
 
+                # if tagp in ("consistent", "consistent_docus"):
+                #     if used_source != "skip_no_units":
+                #         f.write(f"[RAW CANDIDATES] power={pwr} n={len(raw_items)}\n")
+                #         for j, (a, p) in enumerate(raw_items):
+                #             f.write(f"  R{j:02d}  p={float(p):.8f}  action={_fmt_action(a)}\n")
+
+                #         f.write(f"[KEPT CANDIDATES] power={pwr} n={len(items)}\n")
+                #         for j, (a, p) in enumerate(items):
+                #             f.write(f"  K{j:02d}  p={float(p):.8f}  action={_fmt_action(a)}\n")
+
+                #         f.write(f"[FILTERED OUT] power={pwr} n={len(dropped)}\n")
+                #         for j, (a, p, reason) in enumerate(dropped):
+                #             f.write(
+                #                 f"  D{j:02d}  p={float(p):.8f}  reason={reason}  action={_fmt_action(a)}\n"
+                #             )
+
+                #     f.write(f"[FINAL CHOICE] power={pwr} orders={tmp_orders.get(pwr, [])}\n")
+
+                #     if used_source != "skip_no_units":
+                #         _check_consistent_candidate_bug_or_raise(
+                #             f=f,
+                #             phase_str=phase_str,
+                #             power=pwr,
+                #             raw_items=raw_items,
+                #             items=items,
+                #             dropped=dropped,
+                #             orders=tmp_orders.get(pwr, []),
+                #         )
+                # if tagp == "consistent":
+                    # f.write(f"[FINAL CHOICE] power={pwr} orders={tmp_orders.get(pwr, [])}\n")
+
+                    # # 无单位时前面已经直接跳过选单了，这里不要再做异常检查
+                    # if used_source != "skip_no_units":
+                    #     _check_consistent_candidate_bug_or_raise(
+                    #         f=f,
+                    #         phase_str=phase_str,
+                    #         power=pwr,
+                    #         raw_items=raw_items,
+                    #         items=items,
+                    #         dropped=dropped,
+                    #         orders=tmp_orders.get(pwr, []),
+                    #     )
+
             # set orders
             set_t0 = time.perf_counter()
             f.write("[ORDERS SET]\n")
@@ -694,9 +785,12 @@ def main():
 
             f.write("[POST CHECK]\n")
 
-            checker = agent_pool.get("consistent", None)
-            if checker is None or (not hasattr(checker, "audit_final_orders")):
-                checker = None
+            checker = None
+            for name in ("consistent", "consistent_docus"):
+                cand = agent_pool.get(name, None)
+                if cand is not None and hasattr(cand, "audit_final_orders"):
+                    checker = cand
+                    break
 
             for pwr in POWERS:
                 orders = tmp_orders.get(pwr, [])
@@ -751,11 +845,12 @@ def main():
             )
 
             # ----------------------------
-            # ✅ support_total / support_success（严格匹配版）
+            # ✅ support_total / support_success（严格匹配版，含 convoy）
             #   success 定义：
-            #     - support move：被支持方自己确实下了 A - B
-            #     - support hold：被支持方自己确实下了 A H
-            #   注意：这里只看“支持对象是否对上”，不看最终是否打赢/占住
+            #     - support move：被支持方自己确实下了 src -> dest
+            #     - support hold：被支持方自己确实下了 src H
+            #     - convoy：被 convoy 的陆军自己确实下了 src -> dest（可带 VIA，也可不强制）
+            #   注意：这里只看“协作对象是否对上”，不看最终是否打赢/占住/是否 convoy 成功执行
             # ----------------------------
             st_after = game.get_state()
             if not isinstance(st_after, dict) and hasattr(st_after, "to_dict"):
@@ -810,42 +905,64 @@ def main():
                 if toks[2] != "H":
                     return False
                 return _same_loc(toks[1], src)
+            def _is_exact_convoyed_move(order: str, src: str, dest: str) -> bool:
+                """
+                判断某条 order 是否正好是被 convoy 的陆军从 src -> dest。
+                这里不强制要求出现 VIA，只要求是 Army 的 src -> dest。
+                """
+                toks = str(order).strip().split()
+                if len(toks) < 4:
+                    return False
+                if toks[0] != "A":
+                    return False
+                if toks[2] != "-":
+                    return False
+                return _same_loc(toks[1], src) and _same_loc(toks[3], dest)
 
             for pwr in POWERS:
                 for od in (tmp_orders.get(pwr, []) or []):
-                    s = str(od)
-                    if " S " not in s:
+                    s = str(od).strip()
+
+                    is_support = " S " in s
+                    is_convoy = " C " in s
+                    if not is_support and not is_convoy:
                         continue
 
-                    # 该玩家发出了一条 support 命令
+                    # 该玩家发出了一条 support / convoy 命令
                     support_total[pwr] += 1
 
-                    rhs = s.split(" S ", 1)[1].strip()
+                    rhs = s.split(" S ", 1)[1].strip() if is_support else s.split(" C ", 1)[1].strip()
                     rtoks = rhs.split()
                     if len(rtoks) < 2:
                         continue
 
-                    # 被支持单位的初始位置
                     sup_loc = rtoks[1]
                     sup_owner = _find_owner_by_loc(sup_loc)
-                    if not sup_owner:
+                    if sup_owner is None:
                         continue
 
-                    # 被支持玩家这回合自己实际下的 orders
                     supported_orders = tmp_orders.get(sup_owner, []) or []
 
-                    # support move：检查被支持玩家是否真的下了 src -> dest
+                    # 情况 1：support move 或 convoy（rhs 带 '-'）
                     if "-" in rtoks:
                         i = rtoks.index("-")
-                        if i + 1 < len(rtoks):
-                            dest = rtoks[i + 1]
+                        if i + 1 >= len(rtoks):
+                            continue
+                        dest = rtoks[i + 1]
+
+                        if is_support:
                             if any(_is_exact_supported_move(x, sup_loc, dest) for x in supported_orders):
                                 support_success[pwr] += 1
 
-                    # support hold：检查被支持玩家是否真的下了 src H
+                        elif is_convoy:
+                            if any(_is_exact_convoyed_move(x, sup_loc, dest) for x in supported_orders):
+                                support_success[pwr] += 1
+
+                    # 情况 2：support hold（convoy 不会走这里）
                     else:
-                        if any(_is_exact_supported_hold(x, sup_loc) for x in supported_orders):
-                            support_success[pwr] += 1
+                        if is_support:
+                            if any(_is_exact_supported_hold(x, sup_loc) for x in supported_orders):
+                                support_success[pwr] += 1
 
             step += 1 
             # ----------------------------
@@ -968,7 +1085,7 @@ def main():
         for p in POWERS:
             row[f"sc_{p}"] = sc_counts[p]
         for p in POWERS:
-            row[f"sos_{p}"] = sos_map[p]
+            row[f"sos_{p}"] = fmt_float(sos_map[p], 6)
         for p in POWERS:
             row[f"c1_{p}"] = per_power_check_counts[p]["C1"]
             row[f"c2_{p}"] = per_power_check_counts[p]["C2"]

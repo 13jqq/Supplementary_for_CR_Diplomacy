@@ -7,9 +7,7 @@ from typing import Any, Dict, List, Tuple
 
 # ✅ 这里假设你的 ConsistentAgent / load_cicero / get_territory_parts / POWERS
 # 都在同目录的 consistent_agent.py 里（文件名你可按实际改）
-from consistent_agent import POWERS, get_territory_parts, load_cicero
-
-
+from consistent_agent_V2 import POWERS, get_territory_parts, load_consistent_agent
 def main():
     """
     用 consistent_agent 跑一个 dipcc game：
@@ -33,7 +31,7 @@ def main():
     # ✅ 修改：默认走 bqre_topK，并把 choices 加上 bqre_topK
     parser.add_argument("--source", type=str, default="bqre_topK",
                         choices=["bqre_topK", "search_br", "bp"])
-    parser.add_argument("--mode", type=str, default="top1", choices=["top1", "sample"])
+    parser.add_argument("--mode", type=str, default="top1", choices=["top1", "sample", "bqre"])
     parser.add_argument("--topk", type=int, default=30)
     parser.add_argument("--max_phases", type=int, default=60)
 
@@ -74,7 +72,8 @@ def main():
     log_path = args.log if args.log else os.path.join(log_dir, f"consistent_{ts}.log")
 
     # 3) 加载 agent + 初始化 game/state
-    agent = load_cicero(args.cfg, skip_cache=False)
+    # agent = load_cicero(args.cfg, skip_cache=False)
+    agent = load_consistent_agent(args.cfg, skip_cache=False)
     game = pydipcc.Game()
     states = {p: agent.initialize_state(p) for p in POWERS}
 
@@ -123,16 +122,33 @@ def main():
             tmp_orders: Dict[str, List[str]] = {}
 
             for pwr in POWERS:
-                orders, items, used_source, dropped = agent.choose_orders(
+                # orders, items, used_source, dropped = agent.choose_orders(
+                #     game=game,
+                #     power=pwr,
+                #     agent_state=states[pwr],
+                #     source=args.source,
+                #     top_k=args.topk,
+                #     mode=args.mode,
+                # )
+                # tmp_orders[pwr] = orders
+                # all_infos[pwr] = (items, used_source, dropped)
+                info = agent.get_orders_info(
                     game=game,
                     power=pwr,
-                    agent_state=states[pwr],
+                    state=states[pwr],
                     source=args.source,
                     top_k=args.topk,
                     mode=args.mode,
                 )
+                orders = info["orders"]
+                items = info["items"]
+                used_source = info["used_source"]
+                dropped = info["dropped"]
+                raw_items = info.get("raw_items", []) or []
+                repair_logs = info.get("repair_logs", []) or []
+
                 tmp_orders[pwr] = orders
-                all_infos[pwr] = (items, used_source, dropped)
+                all_infos[pwr] = (items, used_source, dropped, raw_items, repair_logs)
 
             f.write("\n" + "=" * 90 + "\n")
             f.write(f"[STEP {step:04d}] phase={phase}\n")
@@ -160,8 +176,20 @@ def main():
 
             # ✅ 打印 7 国各自的 FILTERED OUT（以及可选的 topk 列表）
             for pwr in POWERS:
-                items, used_source, dropped = all_infos[pwr]
+                items, used_source, dropped, raw_items, repair_logs = all_infos[pwr]
                 f.write(f"[AGENT] power={pwr} used_source={used_source} topk={len(items)}\n")
+
+                if repair_logs:
+                    f.write(f"[REPAIR] power={pwr} n={len(repair_logs)}\n")
+                    for j, ev in enumerate(repair_logs):
+                        f.write(
+                            f"  {ev['tag']}-{j:02d} "
+                            f"dest='{ev.get('dest', '')}' "
+                            f"replaced='{ev.get('replaced', '')}' "
+                            f"modified_to='{ev.get('modified_to', '')}'\n"
+                        )
+                        f.write(f"    before={list(ev.get('before_action', []))}\n")
+                        f.write(f"    after ={list(ev.get('after_action', []))}\n")
 
                 f.write(f"[FILTERED OUT] power={pwr} n={len(dropped)}\n")
                 for j, (a, pp, rsn) in enumerate(dropped):

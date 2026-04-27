@@ -1,18 +1,18 @@
 includes { path: "searchbot/qre_rol0_p30.prototxt"; mount: "consistent_agent.base_searchbot_cfg" }
 
 consistent_agent {
-    base_searchbot_cfg {
-      model_path: "models/rl_search_orders.ckpt"
-      value_model_path: "models/rl_value_function.ckpt"
+  base_searchbot_cfg {
+    model_path: "models/rl_search_orders.ckpt"
+    value_model_path: "models/diplodocus_high_rl_value_function.ckpt"
 
-      br_corr_bilateral_search {
-        enable_for_pseudo_order: True
-        enable_for_final_order: True
-        use_all_power_for_p_joint: True
-        br_regularize_lambda: 3e-3
-        min_unnormalized_weight: 0.02
-        max_unnormalized_weight: 10
-      }
+    br_corr_bilateral_search {
+      enable_for_pseudo_order: True
+      enable_for_final_order: True
+      use_all_power_for_p_joint: True
+      br_regularize_lambda: 3e-3
+      min_unnormalized_weight: 0.02
+      max_unnormalized_weight: 10
+    }
 
       rollouts_cfg {
           year_spring_prob_of_ending: "1901,0.0;1909,1.0"
@@ -55,6 +55,7 @@ consistent_agent {
         max_lambda: 3e-1
       }
     }
+    
     do_bayesian_updates: False  # webdip servicer currently doesn't support bayesian update
     num_player_types: 6
     agent_type: 2 # 1-based -> lambda=3e-3

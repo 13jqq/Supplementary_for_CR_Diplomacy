@@ -1,9 +1,7 @@
 import argparse
 import csv
-import os
 import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import List, Optional, Set
 
@@ -18,35 +16,66 @@ POWERS = [
     "TURKEY",
 ]
 
+AGENT_CHOICES = [
+    "consistent",
+    "consistent_docus",
+    "cicero_nopress",
+    "diplodocus_high",
+    "diplodocus_low",
+    "searchbot",
+    "dipnet",
+    "searchbot_neurips21_dora",
+]
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-ROOT_DIRS = {
-    "dipnet": PROJECT_ROOT / "logs_batch" / "log_dipnet_V1",
-    "searchbot": PROJECT_ROOT / "logs_batch" / "log_searchbot_V1",
-    "diplodocus_high": PROJECT_ROOT / "logs_batch" / "log_diplodocus_high_V1",
-    "cicero_nopress": PROJECT_ROOT / "logs_batch" / "log_cicero_nopress_V1",
+# 仅用于文件夹显示名；csv/log 和命令行里仍保留真实 agent 名称
+AGENT_FOLDER_ALIAS = {
+    "consistent": "consistent",
+    "consistent_docus": "consistent_docus",
+    "cicero_nopress": "cicero",
+    "diplodocus_high": "diplodocus",
+    "diplodocus_low": "diplodocus_low",
+    "searchbot": "searchbot",
+    "dipnet": "dipnet",
+    "searchbot_neurips21_dora": "dora",
 }
+
+
+def normalize_version_tag(version: str) -> str:
+    s = str(version).strip()
+    if not s:
+        return "V1"
+    if s[0] in ("v", "V"):
+        s = s[1:]
+    return f"V{s}"
+
+
+def version_lower(version: str) -> str:
+    return normalize_version_tag(version).lower()
+
+
+def power_dir_name(power: str) -> str:
+    return str(power).strip().title()
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Scan per-power CSVs, find missing seeds, delete incomplete logs, and rerun missing jobs."
+        description="Scan per-power CSVs, find missing seeds, delete incomplete logs, and rerun missing jobs under the new generic batch-runner layout."
     )
 
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--dipnet", action="store_true")
-    group.add_argument("--searchbot", action="store_true")
-    group.add_argument("--diplodocus_high", action="store_true")
-    group.add_argument("--cicero_nopress", action="store_true")
+    parser.add_argument("--setup", default="1v6", choices=["1v6", "all7"])
+    parser.add_argument("--my_agent", default="consistent", choices=AGENT_CHOICES)
+    parser.add_argument("--opp_agent", required=True, choices=AGENT_CHOICES)
+    parser.add_argument("--all_agent", default="consistent", choices=AGENT_CHOICES)
 
-    parser.add_argument("--setup", default="1v6")
-    parser.add_argument("--my_agent", default="consistent")
+    parser.add_argument("--version", default="V1")
     parser.add_argument("--source", default="bqre_topK")
-    parser.add_argument("--mode", default="top1")
+    parser.add_argument("--mode", default="bqre")
+    parser.add_argument("--topk", type=int, default=30)
+
     parser.add_argument("--seed_start", type=int, default=0)
     parser.add_argument("--seed_end", type=int, default=9)
 
-    # 可选项
     parser.add_argument(
         "--csv_name",
         type=str,
@@ -67,26 +96,38 @@ def parse_args():
     return parser.parse_args()
 
 
-def resolve_opp_agent(args):
-    if args.dipnet:
-        return "dipnet"
-    if args.searchbot:
-        return "searchbot"
-    if args.diplodocus_high:
-        return "diplodocus_high"
-    if args.cicero_nopress:
-        return "cicero_nopress"
-    raise ValueError("No opponent agent selected")
+def build_root_dir(args) -> Path:
+    version_tag = normalize_version_tag(args.version)
+    my_dir = f"{args.my_agent}_{args.setup}"
+
+    my_disp = AGENT_FOLDER_ALIAS.get(args.my_agent, args.my_agent)
+    opp_disp = AGENT_FOLDER_ALIAS.get(args.opp_agent, args.opp_agent)
+
+    return PROJECT_ROOT / "logs_batch" / my_dir / f"log_{my_disp}_vs_{opp_disp}_{version_tag}"
 
 
 def ensure_dirs(root_dir: Path):
     root_dir.mkdir(parents=True, exist_ok=True)
     for power in POWERS:
-        (root_dir / power).mkdir(parents=True, exist_ok=True)
+        (root_dir / power_dir_name(power)).mkdir(parents=True, exist_ok=True)
 
 
-def log_path_for(root_dir: Path, power: str, opp_agent: str, seed: int) -> Path:
-    return root_dir / power / f"run_1v6_my{power}_myconsistent_opp{opp_agent}_seed{seed}.log"
+def log_path_for(root_dir: Path, power: str, my_agent: str, opp_agent: str, seed: int, version: str) -> Path:
+    pdir = root_dir / power_dir_name(power)
+    vlow = version_lower(version)
+    return pdir / f"run_1v6_my{power}_my{my_agent}_opp{opp_agent}_seed{seed}_{vlow}.log"
+
+
+def csv_has_seed_column(csv_path: Path) -> bool:
+    try:
+        with csv_path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+        if not header:
+            return False
+        return "seed" in [h.strip() for h in header]
+    except Exception:
+        return False
 
 
 def find_seed_csv(power_dir: Path, csv_name: Optional[str] = None) -> Optional[Path]:
@@ -111,24 +152,14 @@ def find_seed_csv(power_dir: Path, csv_name: Optional[str] = None) -> Optional[P
     return None
 
 
-def csv_has_seed_column(csv_path: Path) -> bool:
-    try:
-        with csv_path.open("r", encoding="utf-8", newline="") as f:
-            reader = csv.reader(f)
-            header = next(reader, None)
-        if not header:
-            return False
-        return "seed" in [h.strip() for h in header]
-    except Exception:
-        return False
-
-
 def read_completed_seeds(csv_path: Path, seed_start: int, seed_end: int) -> Set[int]:
     completed = set()
     with csv_path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
-        if "seed" not in (reader.fieldnames or []):
+        fieldnames = [x.strip() for x in (reader.fieldnames or [])]
+        if "seed" not in fieldnames:
             raise ValueError(f"'seed' column not found in {csv_path}")
+
         for row in reader:
             raw = row.get("seed", "")
             try:
@@ -157,34 +188,36 @@ def delete_incomplete_log_if_exists(log_path: Path, dry_run: bool = False):
             log_path.unlink()
 
 
-def run_one(power: str, seed: int, opp_agent: str, root_dir: Path, args) -> int:
-    log_path = log_path_for(root_dir, power, opp_agent, seed)
+def run_one(power: str, seed: int, root_dir: Path, args) -> int:
+    log_path = log_path_for(
+        root_dir=root_dir,
+        power=power,
+        my_agent=args.my_agent,
+        opp_agent=args.opp_agent,
+        seed=seed,
+        version=args.version,
+    )
+    power_dir = root_dir / power_dir_name(power)
 
     cmd = [
         sys.executable,
         "-m",
-        "consistent_runner_for",
-        "--setup",
-        args.setup,
-        "--power",
-        power,
-        "--seed",
-        str(seed),
-        "--my_agent",
-        args.my_agent,
-        "--opp_agent",
-        opp_agent,
-        "--source",
-        args.source,
-        "--mode",
-        args.mode,
-        "--log_dir",
-        str(root_dir / power),
-        "--log",
-        str(log_path),
+        "fairdiplomacy.agents.consistent_runner_for",
+        "--setup", args.setup,
+        "--power", power,
+        "--seed", str(seed),
+        "--my_agent", args.my_agent,
+        "--opp_agent", args.opp_agent,
+        "--all_agent", args.all_agent,
+        "--source", args.source,
+        "--mode", args.mode,
+        "--topk", str(args.topk),
+        "--exp_version", normalize_version_tag(args.version),
+        "--log_dir", str(power_dir),
+        "--log", str(log_path),
     ]
 
-    print(f"[RUN] power={power} seed={seed} opp={opp_agent}")
+    print(f"[RUN] power={power} seed={seed} my={args.my_agent} opp={args.opp_agent}")
     print(" ".join(cmd))
 
     if args.dry_run:
@@ -196,18 +229,20 @@ def run_one(power: str, seed: int, opp_agent: str, root_dir: Path, args) -> int:
 
 def main():
     args = parse_args()
-    opp_agent = resolve_opp_agent(args)
-    root_dir = ROOT_DIRS[opp_agent]
+    root_dir = build_root_dir(args)
 
     ensure_dirs(root_dir)
 
     total_missing = 0
     plan = []
 
-    # 先扫描
-    print(f"[SCAN] opponent={opp_agent}")
+    print(
+        f"[SCAN] my_agent={args.my_agent} opp_agent={args.opp_agent} "
+        f"setup={args.setup} version={normalize_version_tag(args.version)}"
+    )
+
     for power in POWERS:
-        power_dir = root_dir / power
+        power_dir = root_dir / power_dir_name(power)
         csv_path = find_seed_csv(power_dir, args.csv_name)
         missing = compute_missing_seeds(csv_path, args.seed_start, args.seed_end)
 
@@ -228,15 +263,20 @@ def main():
         print("[DONE] no missing seeds found")
         return
 
-    # 删除旧 log
     for power, seed in plan:
-        log_path = log_path_for(root_dir, power, opp_agent, seed)
+        log_path = log_path_for(
+            root_dir=root_dir,
+            power=power,
+            my_agent=args.my_agent,
+            opp_agent=args.opp_agent,
+            seed=seed,
+            version=args.version,
+        )
         delete_incomplete_log_if_exists(log_path, dry_run=args.dry_run)
 
-    # 补跑
     failed = []
     for power, seed in plan:
-        rc = run_one(power, seed, opp_agent, root_dir, args)
+        rc = run_one(power, seed, root_dir, args)
         if rc != 0:
             failed.append((power, seed, rc))
             print(f"[FAILED] power={power} seed={seed} returncode={rc}")

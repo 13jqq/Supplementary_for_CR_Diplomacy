@@ -20,11 +20,13 @@ POWERS = [
 
 AGENT_CHOICES = [
     "consistent",
+    "consistent_docus",
     "cicero_nopress",
     "diplodocus_high",
     "diplodocus_low",
     "searchbot",
     "dipnet",
+    "searchbot_neurips21_dora",
 ]
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -33,13 +35,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # 仅用于文件夹显示名；csv/log 里仍保留真实 agent 名称
 AGENT_FOLDER_ALIAS = {
     "consistent": "consistent",
+    "consistent_docus": "consistent_docus",
     "cicero_nopress": "cicero",
     "diplodocus_high": "diplodocus",
     "diplodocus_low": "diplodocus_low",
     "searchbot": "searchbot",
     "dipnet": "dipnet",
+    "searchbot_neurips21_dora": "dora",
 }
-
 
 def normalize_version_tag(version: str) -> str:
     s = str(version).strip()
@@ -152,7 +155,7 @@ def run_one_task(task, args, root_dir: Path) -> int:
     cmd = [
         sys.executable,
         "-m",
-        "consistent_runner_for",
+        "fairdiplomacy.agents.consistent_runner_for",
         "--setup", args.setup,
         "--power", power,
         "--seed", str(seed),
@@ -176,6 +179,7 @@ def run_one_task(task, args, root_dir: Path) -> int:
 def main():
     args = parse_args()
     root_dir = build_root_dir(args)
+    print(f"[ROOT_DIR] {root_dir}")
 
     ensure_dirs(root_dir)
 

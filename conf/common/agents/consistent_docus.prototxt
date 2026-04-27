@@ -1,0 +1,53 @@
+includes { path: "searchbot/qre_rol0_p30.prototxt"; mount: "consistent_agent.base_searchbot_cfg" }
+
+consistent_agent {
+  base_searchbot_cfg {
+    model_path: "models/diplodocus_high_rl_policy.ckpt"
+    value_model_path: "models/diplodocus_high_rl_value_function.ckpt"
+    rollout_model_path: "models/no_press_human_imitation_policy.ckpt"
+
+    rollouts_cfg {
+      year_spring_prob_of_ending: "1901,0.0;1909,1.0"
+    }
+
+    plausible_orders_cfg {
+      do_parlai_rescoring: false
+      n_rescore: 30
+      parlai_req_size: 30
+      parlai_batch_size: 30
+      n_plausible_orders: 35
+      batch_size: 512
+      allow_multi_gpu: 1
+      exclude_n_holds: 3
+      req_size: 1024
+      max_actions_units_ratio: 3.5
+    }
+
+    n_rollouts: 256
+    bp_iters: 0
+    loser_bp_value: 0
+    loser_bp_iter: 0
+    cfr_messages: false
+    do_incremental_search: true
+    use_greedy_po_for_rollout: true
+    half_precision: true
+  }
+
+  do_bayesian_updates: false
+  num_player_types: 4
+  pow_lambdas_1901_spring: 0.5
+  agent_type_is_public: false
+
+  player_types {
+    log_uniform {
+      min_lambda: 1e-4
+      max_lambda: 1e-1
+      policies {
+        name: "bp"
+        model_path: "models/no_press_human_imitation_policy.ckpt"
+      }
+    }
+  }
+
+  agent_type: 1
+}

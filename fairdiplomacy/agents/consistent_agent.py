@@ -17,6 +17,16 @@ class ConsistentAgent(BQRE1PAgent):
       1) get_orders(...): 标准 agent 接口，只返回最终 orders
       2) get_orders_info(...): 返回详细信息，供 runner 记日志
     """
+    # source controls how the candidate distribution is produced:
+    #   - "bp": use blueprint/plausible policy
+    #   - "bqre_topK": use BQRE run_search result
+    #   - "search_br": use bilateral best-response search result
+    #
+    # mode controls how the final action is selected after top-k truncation
+    # and C1-C4 consistency filtering:
+    #   - "top1": choose the highest-probability filtered action
+    #   - "sample": choose from filtered actions using sharpened sampling (p^2)
+    #   - "bqre": choose using native BQRE-style sampling with consistency rejection
 
     def get_orders_info(
         self,
@@ -47,37 +57,32 @@ class ConsistentAgent(BQRE1PAgent):
         )
         dist: Dict[Any, float] = bp_policy.get(power, {}) or {}
         used_source = "bp"
+        # res = None
 
         # 2) choose source
+
         if source == "bqre_topK":
-            try:
-                res = self.run_search(
-                    game,
-                    bp_policy=bp_policy,
-                    agent_power=power,
-                    agent_state=state,
-                )
-                dist = res.get_agent_policy().get(power, {}) or {}
-                used_source = "bqre_topK"
-            except Exception:
-                dist = bp_policy.get(power, {}) or {}
-                used_source = "bp"
+            res = self.run_search(
+                game=game,
+                bp_policy=bp_policy,
+                agent_power=power,
+                agent_state=state,
+            )
+            dist = res.get_agent_policy().get(power, {}) or {}
+            used_source = "bqre_topK"
 
         elif source == "search_br":
-            try:
-                search_res = self.run_best_response_against_correlated_bilateral_search(
-                    game=game,
-                    agent_power=power,
-                    bp_policy=bp_policy,
-                    agent_state=state,
-                )
-                agent_pols = search_res.get_agent_policy()
-                if agent_pols.get(power):
-                    dist = agent_pols[power]
-                    used_source = "search_br"
-            except Exception:
-                dist = bp_policy.get(power, {}) or {}
-                used_source = "bp"
+            search_res = self.run_best_response_against_correlated_bilateral_search(
+                game=game,
+                agent_power=power,
+                bp_policy=bp_policy,
+                agent_state=state,
+            )
+            agent_pols = search_res.get_agent_policy()
+            if agent_pols.get(power):
+                dist = agent_pols[power]
+                used_source = "search_br"
+
 
         # source == "bp" 时保持 blueprint
 
@@ -88,6 +93,7 @@ class ConsistentAgent(BQRE1PAgent):
                 "raw_items": [],
                 "used_source": used_source,
                 "dropped": [],
+                "c3a_logs": [],
             }
 
         # 3) top-k raw candidates
@@ -96,11 +102,12 @@ class ConsistentAgent(BQRE1PAgent):
             raw_items = raw_items[:top_k]
 
         # 4) consistency filter
-        kept, dropped = filter_action_set_by_consistency(game, power, raw_items)
+        kept, dropped , c3a_logs = filter_action_set_by_consistency(game, power, raw_items)
         items = kept if kept else raw_items
 
         # 5) select final action
         action = self._select_action_from_items(items, mode=mode)
+        
 
         orders = list(action) if isinstance(action, (list, tuple)) else [action]
         return {
@@ -109,6 +116,7 @@ class ConsistentAgent(BQRE1PAgent):
             "raw_items": raw_items,
             "used_source": used_source,
             "dropped": dropped,
+            "c3a_logs": c3a_logs,
         }
 
     def get_orders(
@@ -143,7 +151,13 @@ class ConsistentAgent(BQRE1PAgent):
         if not items:
             return []
 
-        if mode in ("sample", "bqre"):
+        if mode == "sample":
+            dist = _sharpen_action_items(items, beta=2.0)
+            if dist is None:
+                return random.choice([a for a, _ in items])
+            return sample_p_dict(dist)
+
+        if mode == "bqre":
             dist = _renorm_action_items(items)
             if dist is None:
                 return random.choice([a for a, _ in items])
@@ -213,6 +227,57 @@ class ConsistentAgent(BQRE1PAgent):
         except Exception:
             return (str(orders),)
 
+
+
+class ConsistentDocusAgent(ConsistentAgent):
+    """
+    和 ConsistentAgent 使用同一套候选提取 + C1~C4 筛选逻辑，
+    但配置文件使用 consistent_docus.prototxt，
+    从而把 Diplodocus-High 的完整 BQRE 决策流程迁移到一致性筛选框架里。
+    """
+    def _get_native_bqre_policy_from_result(self, res: Any, power: str) -> Dict[Any, float]:
+        ptype_policies = (
+            res.ptype_final_policies if res.use_final_iter else res.ptype_avg_policies
+        )
+        return ptype_policies[res.agent_type].get(power, {}) or {}
+
+    def _sample_native_bqre_action_with_consistency(
+        self,
+        *,
+        res: Any,
+        game: Any,
+        power: str,
+        max_trials: int = 12,
+    ) -> Any:
+        policy = self._get_native_bqre_policy_from_result(res, power)
+        if not policy:
+            return []
+
+        last_action = None
+        for _ in range(max_trials):
+            action = sample_p_dict(policy)
+            last_action = action
+
+            ok1, _ = check_c1_intra_turn_consistency(game, power, action)
+            if not ok1:
+                continue
+
+            ok2, _ = check_c2_inter_turn_consistency(game, power, action)
+            if not ok2:
+                continue
+
+            ok3, _ = check_c3_destination_conflict(game, power, action)
+            if not ok3:
+                continue
+
+            ok4, _ = check_c4_self_defense_consistency(game, power, action)
+            if not ok4:
+                continue
+
+            return action
+
+        return last_action
+
 def _renorm_action_items(items: List[Tuple[Any, float]]) -> Dict[Any, float] | None:
     d = {a: max(0.0, float(p)) for a, p in items}
     s = sum(d.values())
@@ -220,14 +285,15 @@ def _renorm_action_items(items: List[Tuple[Any, float]]) -> Dict[Any, float] | N
         return None
     return {a: p / s for a, p in d.items()}
 
-# def _renorm_action_items(items):
-#     d = {a: max(0.0, float(p)) for a, p in items}
-#     s = sum(d.values())
-#     if s <= 0:
-#         return None
-#     return {a: p / s for a, p in d.items()}
-
-
+def _sharpen_action_items(
+    items: List[Tuple[Any, float]],
+    beta: float = 2.0,
+) -> Dict[Any, float] | None:
+    d = {a: max(0.0, float(p)) ** beta for a, p in items}
+    s = sum(d.values())
+    if s <= 0:
+        return None
+    return {a: p / s for a, p in d.items()}
 def load_consistent_agent(cfg_path: str, *, skip_cache: bool = False) -> ConsistentAgent:
     """
     从 consistent_agent.prototxt 读取配置并构造 ConsistentAgent
@@ -243,6 +309,22 @@ def load_consistent_agent(cfg_path: str, *, skip_cache: bool = False) -> Consist
 
     return ConsistentAgent(agent_cfg, skip_base_strategy_model_cache=skip_cache)
 
+def load_consistent_docus_agent(cfg_path: str, *, skip_cache: bool = False) -> ConsistentDocusAgent:
+    """
+    从 consistent_docus.prototxt 读取配置并构造 ConsistentDocusAgent
+    注意：外层仍然读取 consistent_agent 分支，
+    只是内部参数已经替换成 Diplodocus-High 的完整 BQRE 配置。
+    """
+    full_cfg = heyhi.load_config(cfg_path)
+
+    if hasattr(full_cfg, "agent") and hasattr(full_cfg.agent, "consistent_agent"):
+        agent_cfg = full_cfg.agent.consistent_agent
+    elif hasattr(full_cfg, "consistent_agent"):
+        agent_cfg = full_cfg.consistent_agent
+    else:
+        raise ValueError(f"Bad config structure in {cfg_path}: cannot find consistent_agent")
+
+    return ConsistentDocusAgent(agent_cfg, skip_base_strategy_model_cache=skip_cache)
 
 # ====== 新增函数 1：位置规范化（只去掉 *，保留 /SC /NC /EC 等后缀）======
 def _norm_loc(loc: str | None) -> str | None:
@@ -765,6 +847,137 @@ def check_c2_inter_turn_consistency(
 
     return True, ""
 
+def _has_exact_move_in_action(action: Any, src: str, dest: str) -> bool:
+    orders = list(action) if isinstance(action, (list, tuple)) else [str(action)]
+    for od in orders:
+        toks = str(od).strip().split()
+        if len(toks) < 4:
+            continue
+        if toks[2] != "-":
+            continue
+        if str(_norm_loc(toks[1]) or "") == str(_norm_loc(src) or "") and \
+           str(_norm_loc(toks[3]) or "") == str(_norm_loc(dest) or ""):
+            return True
+    return False
+def _is_order_legal_now(game: Any, order: str) -> bool:
+    try:
+        all_possible = game.get_all_possible_orders()
+    except Exception:
+        return False
+
+    toks = str(order).strip().split()
+    if len(toks) < 2:
+        return False
+
+    src = str(_norm_loc(toks[1]) or "")
+    candidates = all_possible.get(src, None)
+
+    if candidates is None and "/" in src:
+        candidates = all_possible.get(src.split("/")[0], None)
+
+    if not candidates:
+        return False
+
+    return str(order).strip() in set(map(str, candidates))
+
+def repair_or_reject_c3_grounding(
+    game: Any,
+    my_power: str,
+    action: Any,
+    *,
+    enable_repair: bool = True,
+    reject_if_cannot_repair: bool = True,
+) -> Tuple[bool, str, Tuple[str, ...], bool, List[Dict[str, Any]]]:
+    """
+    C3a: Cooperative Action Grounding
+    返回:
+      ok, reason, new_action, modified
+    """
+    orders = list(action) if isinstance(action, (list, tuple)) else [str(action)]
+    occ = _build_loc2power(game)
+
+    modified = False
+    new_orders = list(map(str, orders))
+    events: List[Dict[str, Any]] = []
+
+    for idx, od in enumerate(list(new_orders)):
+        s = str(od).strip()
+        if " S " not in s:
+            continue
+
+        lhs_toks = s.split()
+        rhs = s.split(" S ", 1)[1].strip()
+        rtoks = rhs.split()
+
+        # 只处理 support move
+        if len(rtoks) < 4 or "-" not in rtoks:
+            continue
+
+        sup_loc = _norm_loc(rtoks[1]) if len(rtoks) >= 2 else None
+        if not sup_loc:
+            continue
+
+        sup_owner = occ.get(sup_loc)
+        if not sup_owner and "/" not in sup_loc:
+            cand = [v for k, v in occ.items() if k.startswith(sup_loc + "/")]
+            if cand and all(x == cand[0] for x in cand):
+                sup_owner = cand[0]
+
+        # 只处理 support self move
+        if sup_owner != my_power:
+            continue
+
+        i = rtoks.index("-")
+        if i + 1 >= len(rtoks):
+            continue
+        dest = _norm_loc(rtoks[i + 1])
+        if not dest:
+            continue
+
+        # 如果基础动作已经存在，则不用修
+        if _has_exact_move_in_action(tuple(new_orders), sup_loc, dest):
+            continue
+
+        # 构造最简单修复：把当前 support 单位直接改成自己去 DEST
+        if len(lhs_toks) < 2:
+            continue
+        unit_type = lhs_toks[0]
+        unit_src = _norm_loc(lhs_toks[1])
+        repaired_order = f"{unit_type} {unit_src} - {dest}"
+
+        if enable_repair and _is_order_legal_now(game, repaired_order):
+            missing_base_order = f"{rtoks[0]} {sup_loc} - {dest}"
+            events.append({
+                "tag": "C3A_MODIFIED",
+                "support_order": s,
+                "missing_base_order": missing_base_order,
+                "modified_to": repaired_order,
+            })
+            new_orders[idx] = repaired_order
+            modified = True
+            continue
+
+        if reject_if_cannot_repair:
+            missing_base_order = f"{rtoks[0]} {sup_loc} - {dest}"
+            events.append({
+                "tag": "C3A_FILTERED",
+                "support_order": s,
+                "missing_base_order": missing_base_order,
+                "modified_to": repaired_order,
+            })
+            return (
+                False,
+                f"C3_GROUNDING_FILTER: self-support move missing base move {sup_loc}->{dest}, "
+                f"repair_failed='{repaired_order}'",
+                tuple(map(str, orders)),
+                modified,
+                events,
+            )
+
+    if modified:
+        return True, "C3_GROUNDING_MODIFIED", tuple(new_orders), True, events
+
+    return True, "", tuple(new_orders), False, events
 
 def check_c3_destination_conflict(
     game: Any,
@@ -772,13 +985,15 @@ def check_c3_destination_conflict(
     action: Any,
 ) -> Tuple[bool, str]:
     """
-    一致性3：目标地点冲突（Destination Conflict）
+    一致性3：协作动作落地 + 目标地点冲突（C3）
 
-    规则：
-    1) 我支援/护送“盟友”去的目的地 ∩ 我自己单位去的目的地 = ∅
-       - 这里“盟友”指被 support/convoy 的单位不属于我方（用占位 occ 来判断）
-    2) 对同一目标地点，最多只有一个我的单位 Move(含 VIA) 过去；否则应该用 Support
-       - 这里“Convoy过去”理解为：被 convoy 的陆军仍然是 Move 指令（A X - Y VIA），所以统计在 Move 里即可
+    C3a: Cooperative Action Grounding
+    - 若 support self move 缺少真实底层 move，则优先尝试修复；
+    - 若无法修复，则过滤。
+
+    C3b: Destination Deconfliction
+    1) 我支援/护送盟友去的目的地 ∩ 我自己单位去的目的地 = ∅
+    2) 同一目标地点，最多只有一个我的单位 Move(含 VIA) 过去
     """
     # ✅ 只在 Movement phase 做检查（避免 retreat/build 的语法干扰）
     try:
@@ -988,7 +1203,11 @@ def filter_action_set_by_consistency(
     game: Any,
     my_power: str,
     items: List[Tuple[Any, float]],
-) -> Tuple[List[Tuple[Any, float]], List[Tuple[Any, float, str]]]:
+) -> Tuple[
+    List[Tuple[Any, float]],
+    List[Tuple[Any, float, str]],
+    List[Dict[str, Any]],
+]:
     """
     统一过滤器：按 4 个一致性依次过滤 action set
     - 本次只启用一致性1，其余一致性函数先占位不做
@@ -996,33 +1215,53 @@ def filter_action_set_by_consistency(
     """
     kept: List[Tuple[Any, float]] = []
     dropped: List[Tuple[Any, float, str]] = []
+    c3a_logs: List[Dict[str, Any]] = []
 
     for action, p in items:
-        ok, reason = check_c1_intra_turn_consistency(game, my_power, action)
+        current_action = tuple(action) if isinstance(action, (list, tuple)) else (str(action),)
+
+        # ---- C3a: 先做 cooperative grounding（可修复 / 可过滤） ----
+        ok_g, reason_g, current_action, modified, grounding_events = repair_or_reject_c3_grounding(
+            game,
+            my_power,
+            current_action,
+            enable_repair=True,          # 修改开关
+            reject_if_cannot_repair=True # 过滤开关
+        )
+        if grounding_events:
+            c3a_logs.extend(grounding_events)
+
+        if not ok_g:
+            dropped.append((action, p, reason_g))
+            continue
+
+        # ---- C1 ----
+        ok, reason = check_c1_intra_turn_consistency(game, my_power, current_action)
         if not ok:
-            dropped.append((action, p, reason))
+            dropped.append((current_action, p, reason))
             continue
 
-        ok2, reason2 = check_c2_inter_turn_consistency(game, my_power, action)
+        # ---- C2 ----
+        ok2, reason2 = check_c2_inter_turn_consistency(game, my_power, current_action)
         if not ok2:
-            dropped.append((action, p, reason2))
+            dropped.append((current_action, p, reason2))
             continue
 
-
-        ok3, r3 = check_c3_destination_conflict(game, my_power, action)
+        # ---- C3b ----
+        ok3, r3 = check_c3_destination_conflict(game, my_power, current_action)
         if not ok3:
-            dropped.append((action, p, r3))
+            dropped.append((current_action, p, r3))
             continue
 
-        ok4, r4 = check_c4_self_defense_consistency(game, my_power, action)
+        # ---- C4 ----
+        ok4, r4 = check_c4_self_defense_consistency(game, my_power, current_action)
         if not ok4:
-            dropped.append((action, p, r4))
+            dropped.append((current_action, p, r4))
             continue
 
+        kept.append((current_action, p))
 
-        kept.append((action, p))
-
-    return kept, dropped
+    return kept, dropped, c3a_logs
 
 
 
