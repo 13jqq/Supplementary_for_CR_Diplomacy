@@ -7,7 +7,8 @@ from typing import Any, Dict, List, Tuple
 
 # ✅ 这里假设你的 ConsistentAgent / load_cicero / get_territory_parts / POWERS
 # 都在同目录的 consistent_agent.py 里（文件名你可按实际改）
-from consistent_agent_V2 import POWERS, get_territory_parts, load_consistent_agent
+# from consistent_agent_V2 import POWERS, get_territory_parts, load_consistent_agent
+from consistent_agent_V3 import POWERS, get_territory_parts, load_consistent_agent
 def main():
     """
     用 consistent_agent 跑一个 dipcc game：

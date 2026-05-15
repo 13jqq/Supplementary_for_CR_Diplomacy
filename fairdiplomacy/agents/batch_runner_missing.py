@@ -70,7 +70,7 @@ def parse_args():
 
     parser.add_argument("--version", default="V1")
     parser.add_argument("--source", default="bqre_topK")
-    parser.add_argument("--mode", default="bqre")
+    parser.add_argument("--mode", default="bqre", choices=["top1", "sample", "bqre", "constrained_bqre"])
     parser.add_argument("--topk", type=int, default=30)
 
     parser.add_argument("--seed_start", type=int, default=0)

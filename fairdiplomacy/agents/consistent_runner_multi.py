@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Tuple
 import heyhi
 import os
 import csv
+import json
 from fairdiplomacy.agents.consistent_agent_V3 import (
     POWERS,
     get_territory_parts,
@@ -456,8 +457,14 @@ def main():
 
     parser.add_argument("--project_root", type=str, default="/workspace/Diplomacy/diplomacy_cicero")
     parser.add_argument("--power", type=str, default="AUSTRIA", choices=POWERS)
-    parser.add_argument("--setup", type=str, default="1v6", choices=["1v6", "all7"])
+    parser.add_argument("--setup", type=str, default="multi", choices=["1v6", "all7", "multi"])
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--assignment_json", type=str, default=None,
+                        help="JSON dict mapping each power to an agent kind. Required when --setup=multi.")
+    parser.add_argument("--block_seed", type=int, default=None,
+                        help="Logical balanced-randomization block seed, used only for logs/csv.")
+    parser.add_argument("--shift", type=int, default=None,
+                        help="Assignment shift inside a block, used only for logs/csv.")
 
     # ✅ 策略选择：包含我们自己 + 4 个对手
     # 默认先测 DipNet：opp_agent=dipnet
@@ -476,12 +483,7 @@ def main():
     parser.add_argument("--all_agent", type=str, default="consistent", choices=AGENT_TYPES)
         # only affects consistent branch
     parser.add_argument("--source", type=str, default="bqre_topK", choices=["bqre_topK", "search_br", "bp"])
-    parser.add_argument(
-        "--mode",
-        type=str,
-        default="bqre",
-        choices=["top1", "sample", "bqre", "constrained_bqre"],
-    )
+    parser.add_argument("--mode", type=str, default="bqre", choices=["top1", "sample", "bqre", "constrained_bqre"])
     parser.add_argument("--topk", type=int, default=30)
 
     parser.add_argument("--max_phases", type=int, default=60)
@@ -490,6 +492,26 @@ def main():
     parser.add_argument("--exp_version", type=str, default="V1")
 
     args = parser.parse_args()
+
+    # ---- multi-agent assignment parsing ----
+    assignment_map: Dict[str, str] = {}
+    if args.setup == "multi":
+        if not args.assignment_json:
+            raise ValueError("--assignment_json is required when --setup=multi")
+        try:
+            assignment_map = json.loads(args.assignment_json)
+        except Exception as e:
+            raise ValueError(f"Bad --assignment_json: {args.assignment_json}") from e
+
+        missing = [p for p in POWERS if p not in assignment_map]
+        extra = [p for p in assignment_map if p not in POWERS]
+        if missing or extra:
+            raise ValueError(f"assignment_json must contain exactly POWERS. missing={missing}, extra={extra}")
+
+        bad_agents = sorted({a for a in assignment_map.values() if a not in AGENT_TYPES})
+        if bad_agents:
+            raise ValueError(f"Unknown agent(s) in assignment_json: {bad_agents}; choices={AGENT_TYPES}")
+
     seed_everything(args.seed)
 
     # cd to project root for relative conf/model paths
@@ -503,15 +525,22 @@ def main():
     version_tag = normalize_version_tag(args.exp_version)
     version_low = version_tag.lower()
 
-    default_name = (
-        f"run_{args.setup}_my{args.power}_my{args.my_agent}_"
-        f"opp{args.opp_agent}_seed{args.seed}_{version_low}.log"
-    )
+    if args.setup == "multi":
+        bs = args.block_seed if args.block_seed is not None else args.seed
+        sh = args.shift if args.shift is not None else 0
+        default_name = f"run_multi_block{bs}_shift{sh}_seed{args.seed}_{version_low}.log"
+    else:
+        default_name = (
+            f"run_{args.setup}_my{args.power}_my{args.my_agent}_"
+            f"opp{args.opp_agent}_seed{args.seed}_{version_low}.log"
+        )
     log_path = args.log if args.log else os.path.join(log_dir, default_name)
 
     # ---- decide which agent kinds are actually needed in THIS run ----
     needed: set[str] = set()
-    if args.setup == "all7":
+    if args.setup == "multi":
+        needed.update(assignment_map.values())
+    elif args.setup == "all7":
         needed.add(args.all_agent)
     else:
         needed.add(args.my_agent)
@@ -562,14 +591,17 @@ def main():
     game = pydipcc.Game()
 
     # assign agents
-    agent_for_power = pick_agent_for_power(
-        setup=args.setup,
-        my_power=args.power,
-        my_agent_kind=args.my_agent,
-        opp_agent_kind=args.opp_agent,
-        all_agent_kind=args.all_agent,
-        agent_pool=agent_pool,
-    )
+    if args.setup == "multi":
+        agent_for_power = {p: agent_pool[assignment_map[p]] for p in POWERS}
+    else:
+        agent_for_power = pick_agent_for_power(
+            setup=args.setup,
+            my_power=args.power,
+            my_agent_kind=args.my_agent,
+            opp_agent_kind=args.opp_agent,
+            all_agent_kind=args.all_agent,
+            agent_pool=agent_pool,
+        )
     states: Dict[str, Any] = {p: agent_for_power[p].initialize_state(p) for p in POWERS}
     def _tag(pwr: str) -> str:
         ag = agent_for_power[pwr]
@@ -583,7 +615,7 @@ def main():
     with open(log_path, "w", encoding="utf-8") as f:
         f.write("=== RUN START ===\n")
         f.write(f"cwd={os.getcwd()}\n")
-        f.write(f"setup={args.setup} my_power={args.power}\n")
+        f.write(f"setup={args.setup} my_power={args.power} block_seed={args.block_seed} shift={args.shift}\n")
         f.write(f"cfg_consistent={args.cfg_consistent}\n")
         f.write(f"cfg_consistent_docus={args.cfg_consistent_docus}\n")
         f.write(f"cfg_cicero_nopress={args.cfg_cicero_nopress}\n")
@@ -593,6 +625,8 @@ def main():
         f.write(f"cfg_dipnet={args.cfg_dipnet}\n")
         f.write(f"cfg_searchbot_neurips21_dora={args.cfg_searchbot_neurips21_dora}\n")
         f.write(f"my_agent={args.my_agent} opp_agent={args.opp_agent} all_agent={args.all_agent}\n")
+        if args.setup == "multi":
+            f.write("assignment_json=" + json.dumps(assignment_map, ensure_ascii=False, sort_keys=True) + "\n")
         f.write(f"seed={args.seed} source={args.source} mode={args.mode} topk={args.topk} max_phases={args.max_phases}\n")
 
         f.write("[ASSIGNMENT]\n")
@@ -608,10 +642,17 @@ def main():
         support_success = {p: 0 for p in POWERS}
 
         # ✅ 同一组实验写到同一张表
-        csv_path = os.path.join(
-            log_dir,
-            f"results_setup={args.setup}_my={args.my_agent}_opp={args.opp_agent}_{version_low}.csv",
-        )
+        if args.setup == "multi":
+            agent_sig = "-".join(sorted(set(assignment_map.values())))
+            csv_path = os.path.join(
+                log_dir,
+                f"results_setup=multi_agents={agent_sig}_{version_low}.csv",
+            )
+        else:
+            csv_path = os.path.join(
+                log_dir,
+                f"results_setup={args.setup}_my={args.my_agent}_opp={args.opp_agent}_{version_low}.csv",
+            )
         print(f"[LOG_DIR] {log_dir}")
         print(f"[LOG_PATH] {log_path}")
         print(f"[CSV_PATH] {csv_path}")
@@ -1047,10 +1088,14 @@ def main():
         f.write("\n=== FINAL SUMMARY ===\n")
         f.write(f"game_id={game_id}\n")
         f.write(f"seed={args.seed}\n")
+        f.write(f"block_seed={args.block_seed}\n")
+        f.write(f"shift={args.shift}\n")
         f.write(f"setup={args.setup}\n")
         f.write(f"my_power={args.power}\n")
         f.write(f"my_agent={args.my_agent}\n")
         f.write(f"opp_agent={args.opp_agent}\n")
+        if args.setup == "multi":
+            f.write("agent_each_power=" + ",".join([f"{p}:{_tag(p)}" for p in POWERS]) + "\n")
         f.write(f"end_reason={end_reason}\n")
         f.write(f"final_phase={final_phase}\n")
         f.write(f"num_phases={step}\n")
@@ -1078,6 +1123,8 @@ def main():
         row = {
             "game_id": game_id,
             "seed": args.seed,
+            "block_seed": args.block_seed,
+            "shift": args.shift,
             "setup": args.setup,
             "my_power": args.power,
             "my_agent": args.my_agent,
@@ -1087,6 +1134,8 @@ def main():
             "num_phases": step,
         }
 
+        for p in POWERS:
+            row[f"agent_{p}"] = _tag(p)
         for p in POWERS:
             row[f"sc_{p}"] = sc_counts[p]
         for p in POWERS:
