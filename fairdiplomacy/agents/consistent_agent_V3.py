@@ -9,6 +9,47 @@ from fairdiplomacy.utils.sampling import sample_p_dict
 
 POWERS = ["AUSTRIA", "ENGLAND", "FRANCE", "GERMANY", "ITALY", "RUSSIA", "TURKEY"]
 
+ABLATION_CHOICES = ("full", "no_c12", "no_c34", "no_all")
+
+
+def normalize_ablation(ablation: str) -> str:
+    s = str(ablation or "full").strip().lower()
+    alias = {
+        "none": "full",
+        "all": "full",
+        "full": "full",
+
+        "no_c12": "no_c12",
+        "no_c1c2": "no_c12",
+        "no_relation": "no_c12",
+        "w/o_c12": "no_c12",
+
+        "no_c34": "no_c34",
+        "no_c3c4": "no_c34",
+        "no_subplan": "no_c34",
+        "w/o_c34": "no_c34",
+
+        "no_all": "no_all",
+        "no_c1234": "no_all",
+        "no_consistency": "no_all",
+        "w/o_all": "no_all",
+    }
+    if s not in alias:
+        raise ValueError(f"Unknown ablation={ablation}. Choices={ABLATION_CHOICES}")
+    return alias[s]
+
+
+def ablation_modules(ablation: str) -> Tuple[bool, bool]:
+    """
+    Returns:
+      enable_c12: 是否启用 C1+C2 关系一致性模块
+      enable_c34: 是否启用 C3+C4 子计划相容性模块
+    """
+    ablation = normalize_ablation(ablation)
+    enable_c12 = ablation not in ("no_c12", "no_all")
+    enable_c34 = ablation not in ("no_c34", "no_all")
+    return enable_c12, enable_c34
+
 class ConsistentAgent(BQRE1PAgent):
     """
     一致性校验智能体
@@ -37,6 +78,7 @@ class ConsistentAgent(BQRE1PAgent):
         source: str = "bqre_topK",
         top_k: int = 30,
         mode: str = "bqre",
+        ablation: str = "full",
     ) -> Dict[str, Any]:
         """
         输出:
@@ -48,6 +90,7 @@ class ConsistentAgent(BQRE1PAgent):
             "dropped": List[(action, prob, reason)]
         }
         """
+        ablation = normalize_ablation(ablation)
 
         # 1) blueprint policy
         bp_policy: Dict[str, Dict[Any, float]] = self.get_plausible_orders_policy(
@@ -91,9 +134,11 @@ class ConsistentAgent(BQRE1PAgent):
                 "orders": [],
                 "items": [],
                 "raw_items": [],
-                "used_source": used_source,
+                "used_source": f"{used_source}_{ablation}",
                 "dropped": [],
                 "c3a_logs": [],
+                "repair_logs": [],
+                "ablation": ablation,
             }
 
         # 3) top-k raw candidates
@@ -102,7 +147,12 @@ class ConsistentAgent(BQRE1PAgent):
             raw_items = raw_items[:top_k]
 
         # 4) consistency filter
-        kept, dropped, c3a_logs = filter_action_set_by_consistency(game, power, raw_items)
+        kept, dropped, c3a_logs = filter_action_set_by_consistency(
+            game,
+            power,
+            raw_items,
+            ablation=ablation,
+        )
         items = kept if kept else raw_items
 
         # 5) select final action
@@ -150,9 +200,11 @@ class ConsistentAgent(BQRE1PAgent):
             "orders": orders,
             "items": items,
             "raw_items": raw_items,
-            "used_source": used_source,
+            "used_source": f"{used_source}_{ablation}",
             "dropped": dropped,
             "c3a_logs": c3a_logs,
+            "repair_logs": c3a_logs,
+            "ablation": ablation,
         }
 
     def get_orders(
@@ -164,6 +216,7 @@ class ConsistentAgent(BQRE1PAgent):
         source: str = "bqre_topK",
         top_k: int = 30,
         mode: str = "bqre",
+        ablation: str = "full",
     ) -> List[str]:
         """
         标准 agent 接口：只返回最终 orders
@@ -175,6 +228,7 @@ class ConsistentAgent(BQRE1PAgent):
             source=source,
             top_k=top_k,
             mode=mode,
+            ablation=ablation,
         )
         return info["orders"]
 
@@ -1239,16 +1293,25 @@ def filter_action_set_by_consistency(
     game: Any,
     my_power: str,
     items: List[Tuple[Any, float]],
+    *,
+    ablation: str = "full",
 ) -> Tuple[
     List[Tuple[Any, float]],
     List[Tuple[Any, float, str]],
     List[Dict[str, Any]],
 ]:
     """
-    统一过滤器：按 4 个一致性依次过滤 action set
-    - 本次只启用一致性1，其余一致性函数先占位不做
-    - dropped 的 reason 必须带一致性类型，便于 LOG 标注
+    统一过滤器：按 ablation 控制 C1+C2 / C3+C4 两个模块是否启用。
+
+    ablation:
+      - full:    启用 C1+C2+C3+C4
+      - no_c12: 关闭 C1+C2，只保留 C3+C4
+      - no_c34: 关闭 C3+C4，只保留 C1+C2
+      - no_all: 全部关闭
     """
+    ablation = normalize_ablation(ablation)
+    enable_c12, enable_c34 = ablation_modules(ablation)
+
     kept: List[Tuple[Any, float]] = []
     dropped: List[Tuple[Any, float, str]] = []
     c3a_logs: List[Dict[str, Any]] = []
@@ -1256,50 +1319,50 @@ def filter_action_set_by_consistency(
     for action, p in items:
         current_action = tuple(action) if isinstance(action, (list, tuple)) else (str(action),)
 
-        # ---- C3a: 先做 cooperative grounding（可修复 / 可过滤） ----
-        ok_g, reason_g, current_action, modified, grounding_events = repair_or_reject_c3_grounding(
-            game,
-            my_power,
-            current_action,
-            enable_repair=True,          # 修改开关
-            reject_if_cannot_repair=True # 过滤开关
-        )
-        if grounding_events:
-            c3a_logs.extend(grounding_events)
+        # ---- C3a: cooperative grounding 属于 C3+C4 子计划模块 ----
+        # no_c34 / no_all 时，这一步也必须关闭，否则 C3 实际上没有被完全消融。
+        if enable_c34:
+            ok_g, reason_g, current_action, modified, grounding_events = repair_or_reject_c3_grounding(
+                game,
+                my_power,
+                current_action,
+                enable_repair=True,
+                reject_if_cannot_repair=True,
+            )
+            if grounding_events:
+                c3a_logs.extend(grounding_events)
 
-        if not ok_g:
-            dropped.append((action, p, reason_g))
-            continue
+            if not ok_g:
+                dropped.append((action, p, reason_g))
+                continue
 
-        # ---- C1 ----
-        ok, reason = check_c1_intra_turn_consistency(game, my_power, current_action)
-        if not ok:
-            dropped.append((current_action, p, reason))
-            continue
+        # ---- C1 + C2: relation consistency module ----
+        if enable_c12:
+            ok, reason = check_c1_intra_turn_consistency(game, my_power, current_action)
+            if not ok:
+                dropped.append((current_action, p, reason))
+                continue
 
-        # ---- C2 ----
-        ok2, reason2 = check_c2_inter_turn_consistency(game, my_power, current_action)
-        if not ok2:
-            dropped.append((current_action, p, reason2))
-            continue
+            ok2, reason2 = check_c2_inter_turn_consistency(game, my_power, current_action)
+            if not ok2:
+                dropped.append((current_action, p, reason2))
+                continue
 
-        # ---- C3b ----
-        ok3, r3 = check_c3_destination_conflict(game, my_power, current_action)
-        if not ok3:
-            dropped.append((current_action, p, r3))
-            continue
+        # ---- C3 + C4: sub-plan compatibility module ----
+        if enable_c34:
+            ok3, r3 = check_c3_destination_conflict(game, my_power, current_action)
+            if not ok3:
+                dropped.append((current_action, p, r3))
+                continue
 
-        # ---- C4 ----
-        ok4, r4 = check_c4_self_defense_consistency(game, my_power, current_action)
-        if not ok4:
-            dropped.append((current_action, p, r4))
-            continue
+            ok4, r4 = check_c4_self_defense_consistency(game, my_power, current_action)
+            if not ok4:
+                dropped.append((current_action, p, r4))
+                continue
 
         kept.append((current_action, p))
 
     return kept, dropped, c3a_logs
-
-
 
 
 # def main():

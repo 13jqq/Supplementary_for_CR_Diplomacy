@@ -29,7 +29,7 @@ It also outputs assignment balance checks: agent x power counts and agent x powe
 """
 
 from __future__ import annotations
-
+import numpy as np
 import argparse
 import csv
 import itertools
@@ -197,6 +197,18 @@ def parse_args():
         action="store_true",
         help="Also write a long-format per-power sample CSV for debugging.",
     )
+    parser.add_argument(
+        "--n_bootstrap",
+        type=int,
+        default=10000,
+        help="Number of block-level bootstrap replications.",
+    )
+    parser.add_argument(
+        "--bootstrap_seed",
+        type=int,
+        default=0,
+        help="Random seed for block-level bootstrap.",
+    )
     return parser.parse_args()
 
 
@@ -360,6 +372,7 @@ def init_power_stats() -> Dict:
         "c2_total": 0,
         "c3_total": 0,
         "c4_total": 0,
+        "phase_total": 0,
         "support_success_total": 0,
         "support_total_total": 0,
     }
@@ -384,6 +397,11 @@ def update_power_stats(stats: Dict, row: Dict, power: str):
     stats["c2_total"] += _to_int(row.get(f"c2_{power}", 0))
     stats["c3_total"] += _to_int(row.get(f"c3_{power}", 0))
     stats["c4_total"] += _to_int(row.get(f"c4_{power}", 0))
+
+    # denominator for conflict_per_phase.
+    # This is counted once per controlled power sample.
+    stats["phase_total"] += _to_int(row.get("num_phases", 0))
+
     stats["support_success_total"] += _to_int(row.get(f"support_success_{power}", 0))
     stats["support_total_total"] += _to_int(row.get(f"support_total_{power}", 0))
 
@@ -394,6 +412,16 @@ def finalize_power_stats(stats: Dict) -> Dict:
     sc_values = stats["sc_values"]
     sos_ci_low, sos_ci_high = _ci95(sos_values)
     sc_ci_low, sc_ci_high = _ci95(sc_values)
+
+    c_total = (
+        stats["c1_total"]
+        + stats["c2_total"]
+        + stats["c3_total"]
+        + stats["c4_total"]
+    )
+    phase_total = stats.get("phase_total", 0)
+    conflict_per_phase = c_total / phase_total if phase_total else 0.0
+
     support_ratio = (
         stats["support_success_total"] / stats["support_total_total"]
         if stats["support_total_total"] > 0
@@ -421,10 +449,14 @@ def finalize_power_stats(stats: Dict) -> Dict:
         "c2_total": stats["c2_total"],
         "c3_total": stats["c3_total"],
         "c4_total": stats["c4_total"],
+        "conflict_total": c_total,
         "c1_avg_per_sample": stats["c1_total"] / n if n else 0.0,
         "c2_avg_per_sample": stats["c2_total"] / n if n else 0.0,
         "c3_avg_per_sample": stats["c3_total"] / n if n else 0.0,
         "c4_avg_per_sample": stats["c4_total"] / n if n else 0.0,
+        "conflict_avg_per_sample": c_total / n if n else 0.0,
+        "phase_total": phase_total,
+        "conflict_per_phase": conflict_per_phase,
         "support_success_total": stats["support_success_total"],
         "support_total_total": stats["support_total_total"],
         "support_success_ratio": support_ratio,
@@ -514,6 +546,115 @@ def powers_by_agent(row: Dict) -> Dict[str, List[str]]:
     return dict(out)
 
 
+
+def group_rows_by_block_seed(rows: List[Dict]) -> Dict[int, List[Dict]]:
+    grouped: Dict[int, List[Dict]] = defaultdict(list)
+    for row in rows:
+        bs = row_block_seed(row)
+        if bs is None:
+            bs = row_game_seed(row)
+        if bs is None:
+            continue
+        grouped[int(bs)].append(row)
+    return dict(grouped)
+
+
+def compute_power_stats_for_key(
+    rows: List[Dict],
+    agent: str,
+    scope: str,
+    power: str,
+) -> Dict:
+    stats = init_power_stats()
+
+    if scope == "overall":
+        for row in rows:
+            for p in POWERS:
+                ag = str(row.get(f"agent_{p}", "")).strip()
+                if ag == agent:
+                    update_power_stats(stats, row, p)
+
+    elif scope == "per_power":
+        for row in rows:
+            ag = str(row.get(f"agent_{power}", "")).strip()
+            if ag == agent:
+                update_power_stats(stats, row, power)
+
+    else:
+        raise ValueError(f"Unknown scope={scope}")
+
+    return finalize_power_stats(stats)
+
+
+def compute_block_bootstrap_errors(
+    metric_rows: List[Dict],
+    agents: List[str],
+    args,
+) -> Dict[Tuple[str, str, str], Dict[str, float]]:
+    """
+    Block-level bootstrap.
+
+    Unit:
+      - block_seed, not individual power samples and not individual games.
+
+    Reported bootstrap SE:
+      - mean_sos_bootstrap_se
+      - conflict_per_phase_bootstrap_se
+    """
+    n_rep = int(getattr(args, "n_bootstrap", 10000))
+    if n_rep <= 0:
+        return {}
+
+    rows_by_block = group_rows_by_block_seed(metric_rows)
+    block_ids = sorted(rows_by_block.keys())
+    n_units = len(block_ids)
+
+    keys: List[Tuple[str, str, str]] = []
+    for ag in agents:
+        keys.append((ag, "overall", "OVERALL"))
+        for p in POWERS:
+            keys.append((ag, "per_power", p))
+
+    if n_units <= 1:
+        return {
+            key: {
+                "mean_sos_bootstrap_se": 0.0,
+                "conflict_per_phase_bootstrap_se": 0.0,
+                "n_bootstrap_units": n_units,
+                "n_bootstrap_replications": 0,
+            }
+            for key in keys
+        }
+
+    rng = np.random.default_rng(int(getattr(args, "bootstrap_seed", 0)))
+
+    sos_values = {key: [] for key in keys}
+    conflict_values = {key: [] for key in keys}
+
+    for _ in range(n_rep):
+        sampled_blocks = rng.choice(block_ids, size=n_units, replace=True)
+
+        sampled_rows: List[Dict] = []
+        for bs in sampled_blocks:
+            sampled_rows.extend(rows_by_block[int(bs)])
+
+        for key in keys:
+            ag, scope, power = key
+            stat = compute_power_stats_for_key(sampled_rows, ag, scope, power)
+            sos_values[key].append(float(stat.get("mean_sos", 0.0)))
+            conflict_values[key].append(float(stat.get("conflict_per_phase", 0.0)))
+
+    out: Dict[Tuple[str, str, str], Dict[str, float]] = {}
+    for key in keys:
+        out[key] = {
+            "mean_sos_bootstrap_se": float(np.std(sos_values[key], ddof=1)),
+            "conflict_per_phase_bootstrap_se": float(np.std(conflict_values[key], ddof=1)),
+            "n_bootstrap_units": n_units,
+            "n_bootstrap_replications": n_rep,
+        }
+
+    return out
+
 def summarize(rows: List[Dict], agents: List[str], args) -> Dict[str, object]:
     bad_end_reasons = parse_bad_end_reasons(args.bad_end_reasons)
 
@@ -596,27 +737,50 @@ def summarize(rows: List[Dict], agents: List[str], args) -> Dict[str, object]:
         for ag in agents:
             update_agent_game_stats(agent_game_stats[ag], row, ag, sorted(pba.get(ag, [])))
 
+    bootstrap_errors = compute_block_bootstrap_errors(metric_rows, agents, args)
+
     power_summary_rows = []
     for ag in agents:
-        power_summary_rows.append(
-            {
-                "side": "mixed",
-                "agent_name": ag,
-                "scope": "overall",
-                "power": "OVERALL",
-                **finalize_power_stats(overall_by_agent.get(ag, init_power_stats())),
-            }
+        row = {
+            "side": "mixed",
+            "agent_name": ag,
+            "scope": "overall",
+            "power": "OVERALL",
+            **finalize_power_stats(overall_by_agent.get(ag, init_power_stats())),
+        }
+        row.update(
+            bootstrap_errors.get(
+                (ag, "overall", "OVERALL"),
+                {
+                    "mean_sos_bootstrap_se": 0.0,
+                    "conflict_per_phase_bootstrap_se": 0.0,
+                    "n_bootstrap_units": 0,
+                    "n_bootstrap_replications": 0,
+                },
+            )
         )
+        power_summary_rows.append(row)
+
         for p in POWERS:
-            power_summary_rows.append(
-            {
+            row = {
                 "side": "mixed",
                 "agent_name": ag,
                 "scope": "per_power",
                 "power": p,
                 **finalize_power_stats(per_power_by_agent.get((ag, p), init_power_stats())),
             }
-        )
+            row.update(
+                bootstrap_errors.get(
+                    (ag, "per_power", p),
+                    {
+                        "mean_sos_bootstrap_se": 0.0,
+                        "conflict_per_phase_bootstrap_se": 0.0,
+                        "n_bootstrap_units": 0,
+                        "n_bootstrap_replications": 0,
+                    },
+                )
+            )
+            power_summary_rows.append(row)
 
     agent_game_summary_rows = []
     for ag in agents:
@@ -738,21 +902,23 @@ def write_outputs(root_dir: Path, result_csv: Path, agents: List[str], summary: 
     seed_tag = build_seed_tag(args)
     prefix = f"summary_multi_random_{agents_slug(agents)}_{normalize_version_tag(args.version)}_{seed_tag}"
 
-    power_summary_path = root_dir / f"{prefix}_power_samples.csv"
-    agent_game_summary_path = root_dir / f"{prefix}_agent_game_samples.csv"
+    metrics_summary_path = root_dir / f"{prefix}_metrics.csv"
     balance_power_path = root_dir / f"{prefix}_balance_agent_power.csv"
     balance_pair_path = root_dir / f"{prefix}_balance_agent_pair.csv"
     balance_singleton_path = root_dir / f"{prefix}_balance_singleton.csv"
     balance_controlled_n_path = root_dir / f"{prefix}_balance_controlled_n.csv"
     meta_path = root_dir / f"{prefix}.json"
 
-    power_fieldnames = [
+    metric_fieldnames = [
         "side",
         "agent_name",
         "scope",
         "power",
         "n_samples",
+
         "mean_sos",
+        "mean_sos_bootstrap_se",
+
         "win_rate",
         "most_sc_rate",
         "survived_rate",
@@ -761,17 +927,29 @@ def write_outputs(root_dir: Path, result_csv: Path, agents: List[str], summary: 
         "most_sc_count",
         "survived_count",
         "defeated_count",
+
         "c1_total",
         "c2_total",
         "c3_total",
         "c4_total",
+        "conflict_total",
+
         "c1_avg_per_sample",
         "c2_avg_per_sample",
         "c3_avg_per_sample",
         "c4_avg_per_sample",
+        "conflict_avg_per_sample",
+
+        "phase_total",
+        "conflict_per_phase",
+        "conflict_per_phase_bootstrap_se",
+
         "support_success_total",
         "support_total_total",
         "support_success_ratio",
+
+        "n_bootstrap_units",
+        "n_bootstrap_replications",
     ]
     agent_game_fieldnames = [
         "agent_name",
@@ -793,8 +971,7 @@ def write_outputs(root_dir: Path, result_csv: Path, agents: List[str], summary: 
         "support_success_ratio",
     ]
 
-    write_csv(power_summary_path, summary["power_summary_rows"], power_fieldnames)
-    write_csv(agent_game_summary_path, summary["agent_game_summary_rows"], agent_game_fieldnames)
+    write_csv(metrics_summary_path, summary["power_summary_rows"], metric_fieldnames)
     write_csv(balance_power_path, summary["agent_power_balance_rows"])
     write_csv(balance_pair_path, summary["pair_balance_rows"])
     write_csv(balance_singleton_path, summary["singleton_balance_rows"])
@@ -813,10 +990,12 @@ def write_outputs(root_dir: Path, result_csv: Path, agents: List[str], summary: 
         "version": normalize_version_tag(args.version),
         "seed_start": args.seed_start,
         "seed_end": args.seed_end,
+        "n_bootstrap": args.n_bootstrap,
+        "bootstrap_seed": args.bootstrap_seed,
+        "bootstrap_unit": "block_seed",
         **summary["meta"],
         "output_files": {
-            "power_samples_summary": str(power_summary_path),
-            "agent_game_samples_summary": str(agent_game_summary_path),
+            "metrics_summary": str(metrics_summary_path),
             "balance_agent_power": str(balance_power_path),
             "balance_agent_pair": str(balance_pair_path),
             "balance_singleton": str(balance_singleton_path),
@@ -827,8 +1006,7 @@ def write_outputs(root_dir: Path, result_csv: Path, agents: List[str], summary: 
     with meta_path.open("w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
-    print(f"[OK] saved: {power_summary_path}")
-    print(f"[OK] saved: {agent_game_summary_path}")
+    print(f"[OK] saved: {metrics_summary_path}")
     print(f"[OK] saved: {balance_power_path}")
     print(f"[OK] saved: {balance_pair_path}")
     print(f"[OK] saved: {balance_singleton_path}")
@@ -844,7 +1022,7 @@ def write_outputs(root_dir: Path, result_csv: Path, agents: List[str], summary: 
     for r in overall:
         print(
             f"  {r['agent_name']:<28} "
-            f"mean_sos={r['mean_sos']:.6f} ± {r['sem_sos']:.6f} "
+            f"mean_sos={r['mean_sos']:.6f} ± {r['mean_sos_bootstrap_se']:.6f} "
             f"n={r['n_samples']} mean_sc={r['mean_sc']:.3f} support={r['support_success_ratio']:.4f}"
         )
 

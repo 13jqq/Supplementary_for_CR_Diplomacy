@@ -247,6 +247,7 @@ def choose_orders_wrapper(
     source: str,
     top_k: int,
     mode: str,
+    ablation: str,
 ) -> Tuple[
     List[str],
     List[Tuple[Any, float]],
@@ -263,6 +264,7 @@ def choose_orders_wrapper(
             source=source,
             top_k=top_k,
             mode=mode,
+            ablation=ablation,
         )
         raw_items = info.get("raw_items", []) or []
         repair_logs = info.get("repair_logs", []) or []
@@ -485,6 +487,19 @@ def main():
     parser.add_argument("--source", type=str, default="bqre_topK", choices=["bqre_topK", "search_br", "bp"])
     parser.add_argument("--mode", type=str, default="bqre", choices=["top1", "sample", "bqre", "constrained_bqre"])
     parser.add_argument("--topk", type=int, default=30)
+    parser.add_argument(
+        "--ablation",
+        type=str,
+        default="full",
+        choices=["full", "no_c12", "no_c34", "no_all"],
+        help=(
+            "Ablation for ConsistentAgent only: "
+            "full=use C1+C2+C3+C4; "
+            "no_c12=disable C1+C2; "
+            "no_c34=disable C3+C4; "
+            "no_all=disable all consistency filters."
+        ),
+    )
 
     parser.add_argument("--max_phases", type=int, default=60)
     parser.add_argument("--log_dir", type=str, default="logs_consistent")
@@ -627,8 +642,10 @@ def main():
         f.write(f"my_agent={args.my_agent} opp_agent={args.opp_agent} all_agent={args.all_agent}\n")
         if args.setup == "multi":
             f.write("assignment_json=" + json.dumps(assignment_map, ensure_ascii=False, sort_keys=True) + "\n")
-        f.write(f"seed={args.seed} source={args.source} mode={args.mode} topk={args.topk} max_phases={args.max_phases}\n")
-
+        f.write(
+            f"seed={args.seed} source={args.source} mode={args.mode} "
+            f"topk={args.topk} ablation={args.ablation} max_phases={args.max_phases}\n"
+        )
         f.write("[ASSIGNMENT]\n")
         for p in POWERS:
             f.write(f"  {p}: {_tag(p)}\n")
@@ -711,6 +728,7 @@ def main():
                     source=args.source,
                     top_k=args.topk,
                     mode=args.mode,
+                    ablation=args.ablation,
                 )
                 pwr_elapsed = time.perf_counter() - pwr_t0
 
@@ -1129,6 +1147,7 @@ def main():
             "my_power": args.power,
             "my_agent": args.my_agent,
             "opp_agent": args.opp_agent,
+            "ablation": args.ablation,
             "end_reason": end_reason,
             "final_phase": final_phase,
             "num_phases": step,

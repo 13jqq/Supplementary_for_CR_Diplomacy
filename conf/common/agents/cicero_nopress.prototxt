@@ -1,4 +1,5 @@
 includes { path: "searchbot/qre_rol0_p30.prototxt"; mount: "bqre1p.base_searchbot_cfg" }
+##includes { path: "orders/20220305_allorderindependentrollout_bilateralprefix.prototxt"; mount: "bqre1p.base_searchbot_cfg.parlai_model_orders" }#待定
 
 bqre1p {
     base_searchbot_cfg {
@@ -21,7 +22,7 @@ bqre1p {
       
 
       plausible_orders_cfg {
-        do_parlai_rescoring: false
+        do_parlai_rescoring: false  #待定
         n_rescore: 30
         parlai_req_size: 30
         parlai_batch_size: 30
@@ -40,12 +41,14 @@ bqre1p {
       loser_bp_value: 0  # Disabling.
       loser_bp_iter: 0  # Disabling.
 
-      cfr_messages: false
+      cfr_messages: False
       do_incremental_search: true
       use_truthful_pseudoorders: true
       skip_policy_evaluation_for_truthful_pseudoorders: true
       use_greedy_po_for_rollout: true
       half_precision: true
+
+      ## parlai_model_orders { model_path: "models/cicero_imitation_bilateral_orders_prefix"       } #待定
 
       
     }
