@@ -3,8 +3,7 @@ includes { path: "searchbot/qre_rol0_p30.prototxt"; mount: "consistent_agent.bas
 consistent_agent {
   base_searchbot_cfg {
     model_path: "models/rl_search_orders.ckpt"
-    value_model_path: "models/diplodocus_high_rl_value_function.ckpt"
-    ## value_model_path: "models/rl_value_function.ckpt"
+    value_model_path: "models/rl_value_function.ckpt"
 
     br_corr_bilateral_search {
       enable_for_pseudo_order: True
